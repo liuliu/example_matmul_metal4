@@ -32,7 +32,7 @@ struct matmul {
 
 
         // 4. Create a function object
-        guard let matmulFunction = library.makeFunction(name: "simpleMatMul") else {
+        guard let matmulFunction = library.makeFunction(name: "matmul_auto_slice_dynamic_extents") else {
             fatalError("Could not create function")
         }
 
