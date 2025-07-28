@@ -23,39 +23,9 @@ struct matmul {
             fatalError("Could not create command queue")
         }
 
-        // 3. Create a library from inline source
-        let shaderSource = """
-        #include <metal_stdlib>
-        #include <metal_tensor>
-        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-
-        using namespace metal;
-        using namespace mpp::tensor_ops;
-
-        kernel void simpleMatMul(tensor<device half,  dextents<int32_t, 2>, tensor_handle> A,
-                                 tensor<device half,  dextents<int32_t, 2>, tensor_handle> B,
-                                 tensor<device float, dextents<int32_t, 2>, tensor_handle> C,
-                                 uint2 tgid [[threadgroup_position_in_grid]])
-        {
-            // descriptor to create matmul operation that does 64x32 times 32x32 producing 64x32
-            constexpr auto matmulDescriptor = matmul2d_descriptor(64, 32, 0, false, false, false);
-
-            // create matmul op from above descriptor with 4 SIMD-Groups.
-            matmul2d<matmulDescriptor, opscope_simd_groups<4>> matmulOp;
-
-            // Create appropriate slice for this thread group to work on.
-            auto mA = A.offset(0, tgid.y * 64);
-            auto mB = B.offset(tgid.x * 32, 0);
-            auto mC = C.offset(tgid.x * 32, tgid.y * 64);
-
-            // execute the operation. Assumes C is is initialized to zero.
-            matmulOp.run(mA, mB, mC);
-        }
-        """
-
         let library: MTLLibrary
         do {
-            library = try device.makeDefaultLibrary(bundle: .main)
+            library = try device.makeLibrary(URL: URL(fileURLWithPath: "/Users/liu/workspace/matmul/Sources/matmul/default.metallib"))
         } catch {
             fatalError("Could not create library: \(error).")
         }
@@ -76,12 +46,12 @@ struct matmul {
 
         // 6. Prepare data
         let M = 128
-        let N = 64
-        let K = 256
+        let N = 128
+        let K = 128
 
         let sizeA = M * K * MemoryLayout<Float16>.size
         let sizeB = K * N * MemoryLayout<Float16>.size
-        let sizeC = M * N * MemoryLayout<Float>.size
+        let sizeC = M * N * MemoryLayout<Float16>.size
 
         let bufferA = device.makeBuffer(length: sizeA, options: .storageModeShared)
         let bufferB = device.makeBuffer(length: sizeB, options: .storageModeShared)
@@ -125,8 +95,8 @@ struct matmul {
         commandBuffer.waitUntilCompleted()
 
         // 10. Read the results
-        var resultMatrix = [Float](repeating: 0, count: M * N)
-        let resultBufferPointer = bufferC?.contents().bindMemory(to: Float.self, capacity: M * N)
+        var resultMatrix = [Float16](repeating: 0, count: M * N)
+        let resultBufferPointer = bufferC?.contents().bindMemory(to: Float16.self, capacity: M * N)
 
         if let ptr = resultBufferPointer {
             resultMatrix = Array(UnsafeBufferPointer(start: ptr, count: M * N))

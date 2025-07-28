@@ -5,11 +5,14 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 
-kernel void simpleMatMul(tensor<device half,  dextents<int32_t, 2>, tensor_handle> A,
-                         tensor<device half,  dextents<int32_t, 2>, tensor_handle> B,
-                         tensor<device float, dextents<int32_t, 2>, tensor_handle> C,
+kernel void simpleMatMul(device half *A_buf [[buffer(0)]],
+                         device half *B_buf [[buffer(1)]],
+                         device half *C_buf [[buffer(2)]],
                          uint2 tgid [[threadgroup_position_in_grid]])
 {
+    auto A = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(A_buf, dextents<int32_t, 2>(128, 128));
+    auto B = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(B_buf, dextents<int32_t, 2>(128, 128));
+    auto C = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(C_buf, dextents<int32_t, 2>(128, 128));
     // descriptor to create matmul operation that does 64x32 times 32x32 producing 64x32
     constexpr auto matmulDescriptor = matmul2d_descriptor(64, 32, 0, false, false, false);
 
