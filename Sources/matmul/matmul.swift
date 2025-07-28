@@ -25,7 +25,7 @@ struct matmul {
 
         let library: MTLLibrary
         do {
-            library = try device.makeLibrary(URL: URL(fileURLWithPath: "/Users/liu/workspace/matmul/Sources/matmul/default.metallib"))
+            library = try device.makeLibrary(URL: URL(fileURLWithPath: "Sources/matmul/default.metallib"))
         } catch {
             fatalError("Could not create library: \(error).")
         }
@@ -46,8 +46,8 @@ struct matmul {
 
         // 6. Prepare data
         let M = 128
-        let N = 128
-        let K = 128
+        let N = 64
+        let K = 256
 
         let sizeA = M * K * MemoryLayout<Float16>.size
         let sizeB = K * N * MemoryLayout<Float16>.size
