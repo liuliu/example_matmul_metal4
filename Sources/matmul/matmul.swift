@@ -54,10 +54,8 @@ struct matmul {
         """
 
         let library: MTLLibrary
-        let compileOptions = MTLCompileOptions()
-        compileOptions.languageVersion = .version4_0
         do {
-            library = try device.makeLibrary(source: shaderSource, options: compileOptions)
+            library = try device.makeDefaultLibrary(bundle: .main)
         } catch {
             fatalError("Could not create library: \(error).")
         }
