@@ -154,7 +154,7 @@ kernel void matmul_static_slice_dynamic_extents(device half *A_buf [[buffer(0)]]
   } else {
     // Use dynamic slice for this edge case.
     // descriptor to create matmul operation that does \(blockDimensions.K)x\(blockDimensions.M) times \(blockDimensions.N)x\(blockDimensions.K) producing \(blockDimensions.N)x\(blockDimensions.M)
-    constexpr auto matmulDescriptor = matmul2d_descriptor(\(blockDimensions.M), \(blockDimensions.N), dynamic_length_v<int>, \(transpose.left ? "true" : "false"), \(transpose.right ? "true" : "false"), false, matmul2d_descriptor::mode::multiply);
+    constexpr auto matmulDescriptor = matmul2d_descriptor(\(blockDimensions.M), \(blockDimensions.N), dynamic_length_v<int>, \(transpose.left ? "true" : "false"), \(transpose.right ? "true" : "false"), false, matmul2d_descriptor::mode::multiply_accumulate);
 
     // create matmul op from above descriptor with \(executionSIMDGroups) SIMD-Groups.
     matmul2d<matmulDescriptor, execution_simdgroups<\(executionSIMDGroups)>> matmul_op;
@@ -175,10 +175,18 @@ kernel void matmul_static_slice_dynamic_extents(device half *A_buf [[buffer(0)]]
 @main
 struct matmul {
   static func main() {
-    run(M: 3072 * 4, N: 3072, K: 3072 + 64, blockDimensions: GEMMDimensions(M: 128, N: 64, K: 64))
+    profileCorrectness()
+    // run(M: 3072, N: 3072, K: 3072, blockDimensions: GEMMDimensions(M: 128, N: 64, K: 64), duplicatedCount: 1)
+  }
+  
+  static func profileCorrectness() {
+    for i in 1...16384 {
+      print("Problem size: \(i)")
+      run(M: i, N: i, K: i, blockDimensions: GEMMDimensions(M: 128, N: 64, K: 64), duplicatedCount: 1)
+    }
   }
 
-  static func run(M: Int, N: Int, K: Int, blockDimensions: GEMMDimensions) {
+  static func run(M: Int, N: Int, K: Int, blockDimensions: GEMMDimensions, duplicatedCount: Int) {
 
     // 1. Create a reference to the GPU
     guard let device = MTLCreateSystemDefaultDevice() else {
@@ -198,7 +206,6 @@ struct matmul {
     let library: MTLLibrary
     do {
       let source = createSource(matrixDimensions: GEMMDimensions(M: M, N: N, K: K), blockDimensions: blockDimensions, transpose: (left: false, right: true), bias: true, executionSIMDGroups: 4, swapMN: M > N)
-      print(source)
       library = try device.makeLibrary(source: source, options: nil)
     } catch {
       fatalError("Could not create library: \(error).")
@@ -274,7 +281,7 @@ struct matmul {
     let simdgroupWidth = pipelineState.threadExecutionWidth
     let threadsPerThreadgroup = MTLSize(width: simdgroupWidth * 4, height: 1, depth: 1)
 
-    for _ in 0..<20 {
+    for _ in 0..<duplicatedCount {
       computeCommandEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
     }
     computeCommandEncoder.endEncoding()
@@ -290,7 +297,7 @@ struct matmul {
     
     // Determine the amount of work done.
     var operations = 2 * M * N * K
-    operations = operations * 20
+    operations = operations * duplicatedCount
     let gflops = Int(Double(operations) / Double(latency) / 1e9)
     print("GFlops: \(gflops)")
     // 10. Read the results
@@ -311,6 +318,7 @@ struct matmul {
         if abs(expected - Float(resultMatrix[m * N + n])) > 5e-3 {
           print("CPU calculated C[\(m), \(n)]: \(expected)")
           print("GPU calculated C[\(m), \(n)]: \(resultMatrix[m * N + n])")
+          exit(0)
         }
       }
     }
