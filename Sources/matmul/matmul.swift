@@ -8,7 +8,7 @@ struct GEMMDimensions {
   var K: Int
 }
 
-func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensions, transpose: (left: Bool, right: Bool), bias: Bool, executionSIMDGroups: Int) -> String {
+func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensions, transpose: (left: Bool, right: Bool), bias: Bool, executionSIMDGroups: Int, swapMN: Bool) -> String {
   let biasInputTerm: String
   let initializeC: String
   if bias {
@@ -87,6 +87,12 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
     bTileLastKSize = "tgid.x * \(blockDimensions.N), \(matrixDimensions.K / (blockDimensions.K * 2) * (blockDimensions.K * 2))"
     bResidualSlice = "\(blockDimensions.N), \(matrixDimensions.K % (blockDimensions.K * 2))"
   }
+  let swapXY: String
+  if swapMN {
+    swapXY = "tgid.xy = tgid.yx;"
+  } else {
+    swapXY = ""
+  }
   return """
 
 #include <metal_stdlib>
@@ -106,6 +112,7 @@ kernel void matmul_static_slice_dynamic_extents(device half *A_buf [[buffer(0)]]
   auto A = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(A_buf, dextents<int32_t, 2>(\(aMatrixSize)));
   auto B = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(B_buf, dextents<int32_t, 2>(\(bMatrixSize)));
   auto C = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(C_buf, dextents<int32_t, 2>(\(matrixDimensions.N), \(matrixDimensions.M)));
+  \(swapXY)
 
   if (tgid.x * \(blockDimensions.N) + \(blockDimensions.N - 1) < \(matrixDimensions.N) && tgid.y * \(blockDimensions.M) + \(blockDimensions.M - 1) < \(matrixDimensions.M)) {
     // Use static slice.
@@ -120,7 +127,7 @@ kernel void matmul_static_slice_dynamic_extents(device half *A_buf [[buffer(0)]]
     auto cT = matmul_op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), half>();
 \(initializeC)
     #pragma clang loop unroll(full)
-    for (ushort k = 0; k < \(matrixDimensions.K / (blockDimensions.K * 2) * (blockDimensions.K * 2)); k += \(blockDimensions.K * 2)) {
+    for (ushort k = 0; k < \(matrixDimensions.K - (blockDimensions.K * 2) + 1); k += \(blockDimensions.K * 2)) {
       // Create appropriate slice for this thread group to work on.
       auto mA0 = A.slice<\(aSlice)>(\(aTileK1Size));
       auto mB0 = B.slice<\(bSlice)>(\(bTileK1Size));
@@ -168,15 +175,10 @@ kernel void matmul_static_slice_dynamic_extents(device half *A_buf [[buffer(0)]]
 @main
 struct matmul {
   static func main() {
-      run()
+    run(M: 3072 * 4, N: 3072, K: 3072 + 64, blockDimensions: GEMMDimensions(M: 128, N: 64, K: 64))
   }
 
-  static func run() {
-    // 6. Prepare data
-    let M = 3072
-    let N = 3072
-    let K = 3072 + 64 + 3
-    let blockDimensions = GEMMDimensions(M: 128, N: 64, K: 64)
+  static func run(M: Int, N: Int, K: Int, blockDimensions: GEMMDimensions) {
 
     // 1. Create a reference to the GPU
     guard let device = MTLCreateSystemDefaultDevice() else {
@@ -195,7 +197,7 @@ struct matmul {
 
     let library: MTLLibrary
     do {
-      let source = createSource(matrixDimensions: GEMMDimensions(M: M, N: N, K: K), blockDimensions: blockDimensions, transpose: (left: false, right: true), bias: true, executionSIMDGroups: 4)
+      let source = createSource(matrixDimensions: GEMMDimensions(M: M, N: N, K: K), blockDimensions: blockDimensions, transpose: (left: false, right: true), bias: true, executionSIMDGroups: 4, swapMN: M > N)
       print(source)
       library = try device.makeLibrary(source: source, options: nil)
     } catch {
@@ -263,7 +265,12 @@ struct matmul {
     computeCommandEncoder.useResource(bufferC!, usage: .write)
 
       // 8. Dispatch threads
-    let threadgroups = MTLSize(width: (N + blockDimensions.N - 1) / blockDimensions.N, height: (M + blockDimensions.M - 1) / blockDimensions.M, depth: 1)
+    let threadgroups: MTLSize
+    if M > N {
+      threadgroups = MTLSize(width: (M + blockDimensions.M - 1) / blockDimensions.M, height: (N + blockDimensions.N - 1) / blockDimensions.N, depth: 1)
+    } else {
+      threadgroups = MTLSize(width: (N + blockDimensions.N - 1) / blockDimensions.N, height: (M + blockDimensions.M - 1) / blockDimensions.M, depth: 1)
+    }
     let simdgroupWidth = pipelineState.threadExecutionWidth
     let threadsPerThreadgroup = MTLSize(width: simdgroupWidth * 4, height: 1, depth: 1)
 
