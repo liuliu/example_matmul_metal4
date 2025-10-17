@@ -38,36 +38,54 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
   let aTile0Size: String
   let aTileK1Size: String
   let aTileK2Size: String
+  let aTileLastK2Size: String
+  let aResidualSlice: String
+  let aTileLastKSize: String
   if transpose.left {
     aSlice = "\(blockDimensions.M), \(blockDimensions.K)"
     aMatrixSize = "\(matrixDimensions.M), \(matrixDimensions.K)"
     aTile0Size = "tgid.y * \(blockDimensions.M), 0"
     aTileK1Size = "tgid.y * \(blockDimensions.M), k"
     aTileK2Size = "tgid.y * \(blockDimensions.M), k + \(blockDimensions.K)"
+    aTileLastK2Size = "tgid.y * \(blockDimensions.M), \((matrixDimensions.K / blockDimensions.K - 1) * blockDimensions.K)"
+    aTileLastKSize = "tgid.y * \(blockDimensions.M), \(matrixDimensions.K / (blockDimensions.K * 2) * (blockDimensions.K * 2))"
+    aResidualSlice = "\(blockDimensions.M), \(matrixDimensions.K % (blockDimensions.K * 2))"
   } else {
     aSlice = "\(blockDimensions.K), \(blockDimensions.M)"
     aMatrixSize = "\(matrixDimensions.K), \(matrixDimensions.M)"
     aTile0Size = "0, tgid.y * \(blockDimensions.M)"
     aTileK1Size = "k, tgid.y * \(blockDimensions.M)"
     aTileK2Size = "k + \(blockDimensions.K), tgid.y * \(blockDimensions.M)"
+    aTileLastK2Size = "\((matrixDimensions.K / blockDimensions.K - 1) * blockDimensions.K), tgid.y * \(blockDimensions.M)"
+    aTileLastKSize = "\(matrixDimensions.K / (blockDimensions.K * 2) * (blockDimensions.K * 2)), tgid.y * \(blockDimensions.M)"
+    aResidualSlice = "\(matrixDimensions.K % (blockDimensions.K * 2)), \(blockDimensions.M)"
   }
   let bSlice: String
   let bMatrixSize: String
   let bTile0Size: String
   let bTileK1Size: String
   let bTileK2Size: String
+  let bTileLastK2Size: String
+  let bResidualSlice: String
+  let bTileLastKSize: String
   if transpose.right {
     bSlice = "\(blockDimensions.K), \(blockDimensions.N)"
     bMatrixSize = "\(matrixDimensions.K), \(matrixDimensions.N)"
     bTile0Size = "0, tgid.x * \(blockDimensions.N)"
     bTileK1Size = "k, tgid.x * \(blockDimensions.N)"
     bTileK2Size = "k + \(blockDimensions.K), tgid.x * \(blockDimensions.N)"
+    bTileLastK2Size = "\((matrixDimensions.K / blockDimensions.K - 1) * blockDimensions.K), tgid.x * \(blockDimensions.N)"
+    bTileLastKSize = "\(matrixDimensions.K / (blockDimensions.K * 2) * (blockDimensions.K * 2)), tgid.x * \(blockDimensions.N)"
+    bResidualSlice = "\(matrixDimensions.K % (blockDimensions.K * 2)), \(blockDimensions.N)"
   } else {
     bSlice = "\(blockDimensions.N), \(blockDimensions.K)"
     bMatrixSize = "\(matrixDimensions.N), \(matrixDimensions.K)"
     bTile0Size = "tgid.x * \(blockDimensions.N), 0"
     bTileK1Size = "tgid.x * \(blockDimensions.N), k"
     bTileK2Size = "tgid.x * \(blockDimensions.N), k + \(blockDimensions.K)"
+    bTileLastK2Size = "tgid.x * \(blockDimensions.N), \((matrixDimensions.K / blockDimensions.K - 1) * blockDimensions.K)"
+    bTileLastKSize = "tgid.x * \(blockDimensions.N), \(matrixDimensions.K / (blockDimensions.K * 2) * (blockDimensions.K * 2))"
+    bResidualSlice = "\(blockDimensions.N), \(matrixDimensions.K % (blockDimensions.K * 2))"
   }
   return """
 
@@ -89,7 +107,7 @@ kernel void matmul_static_slice_dynamic_extents(device half *A_buf [[buffer(0)]]
   auto B = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(B_buf, dextents<int32_t, 2>(\(bMatrixSize)));
   auto C = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(C_buf, dextents<int32_t, 2>(\(matrixDimensions.N), \(matrixDimensions.M)));
 
-  if (\(matrixDimensions.K % (blockDimensions.K * 2) == 0 ? "true" : "false") && tgid.x * \(blockDimensions.N) + \(blockDimensions.N - 1) < \(matrixDimensions.N) && tgid.y * \(blockDimensions.M) + \(blockDimensions.M - 1) < \(matrixDimensions.M)) {
+  if (tgid.x * \(blockDimensions.N) + \(blockDimensions.N - 1) < \(matrixDimensions.N) && tgid.y * \(blockDimensions.M) + \(blockDimensions.M - 1) < \(matrixDimensions.M)) {
     // Use static slice.
     // descriptor to create matmul operation that does \(blockDimensions.K)x\(blockDimensions.M) times \(blockDimensions.N)x\(blockDimensions.K) producing \(blockDimensions.N)x\(blockDimensions.M)
     constexpr auto matmulDescriptor = matmul2d_descriptor(\(blockDimensions.M), \(blockDimensions.N), \(blockDimensions.K), \(transpose.left ? "true" : "false"), \(transpose.right ? "true" : "false"), false, matmul2d_descriptor::mode::multiply_accumulate);
@@ -101,7 +119,8 @@ kernel void matmul_static_slice_dynamic_extents(device half *A_buf [[buffer(0)]]
     auto mB = B.slice<\(bSlice)>(\(bTile0Size));
     auto cT = matmul_op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), half>();
 \(initializeC)
-    for (ushort k = 0; k < \(matrixDimensions.K); k += \(blockDimensions.K) * 2) {
+    #pragma clang loop unroll(full)
+    for (ushort k = 0; k < \(matrixDimensions.K / (blockDimensions.K * 2) * (blockDimensions.K * 2)); k += \(blockDimensions.K * 2)) {
       // Create appropriate slice for this thread group to work on.
       auto mA0 = A.slice<\(aSlice)>(\(aTileK1Size));
       auto mB0 = B.slice<\(bSlice)>(\(bTileK1Size));
@@ -110,12 +129,25 @@ kernel void matmul_static_slice_dynamic_extents(device half *A_buf [[buffer(0)]]
       matmul_op.run(mA0, mB0, cT);
       matmul_op.run(mA1, mB1, cT);
     }
+    if (\((matrixDimensions.K % (blockDimensions.K * 2) != 0) && (matrixDimensions.K % (blockDimensions.K) == 0) ? "true" : "false")) {
+      auto mA = A.slice<\(aSlice)>(\(aTileLastK2Size));
+      auto mB = B.slice<\(bSlice)>(\(bTileLastK2Size));
+      matmul_op.run(mA, mB, cT);
+    }
+    if (\((matrixDimensions.K % blockDimensions.K != 0) ? "true" : "false")) {
+      constexpr auto matmulDescriptor = matmul2d_descriptor(\(blockDimensions.M), \(blockDimensions.N), \(matrixDimensions.K % (blockDimensions.K * 2)), \(transpose.left ? "true" : "false"), \(transpose.right ? "true" : "false"), false, matmul2d_descriptor::mode::multiply_accumulate);
+      // create matmul op from above descriptor with \(executionSIMDGroups) SIMD-Groups.
+      matmul2d<matmulDescriptor, execution_simdgroups<\(executionSIMDGroups)>> matmul_op;
+      auto mA = A.slice<\(aResidualSlice)>(\(aTileLastKSize));
+      auto mB = B.slice<\(bResidualSlice)>(\(bTileLastKSize));
+      matmul_op.run(mA, mB, cT);
+    }
     auto mC = C.slice<\(blockDimensions.N), \(blockDimensions.M)>(tgid.x * \(blockDimensions.N), tgid.y * \(blockDimensions.M));
     cT.store(mC);
   } else {
     // Use dynamic slice for this edge case.
     // descriptor to create matmul operation that does \(blockDimensions.K)x\(blockDimensions.M) times \(blockDimensions.N)x\(blockDimensions.K) producing \(blockDimensions.N)x\(blockDimensions.M)
-    constexpr auto matmulDescriptor = matmul2d_descriptor(\(blockDimensions.M), \(blockDimensions.N), dynamic_length_v<int>, \(transpose.left ? "true" : "false"), \(transpose.right ? "true" : "false"), false, matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto matmulDescriptor = matmul2d_descriptor(\(blockDimensions.M), \(blockDimensions.N), dynamic_length_v<int>, \(transpose.left ? "true" : "false"), \(transpose.right ? "true" : "false"), false, matmul2d_descriptor::mode::multiply);
 
     // create matmul op from above descriptor with \(executionSIMDGroups) SIMD-Groups.
     matmul2d<matmulDescriptor, execution_simdgroups<\(executionSIMDGroups)>> matmul_op;
@@ -143,7 +175,7 @@ struct matmul {
     // 6. Prepare data
     let M = 3072
     let N = 3072
-    let K = 3073
+    let K = 3072 + 64 + 3
     let blockDimensions = GEMMDimensions(M: 128, N: 64, K: 64)
 
     // 1. Create a reference to the GPU
@@ -163,7 +195,9 @@ struct matmul {
 
     let library: MTLLibrary
     do {
-      library = try device.makeLibrary(source: createSource(matrixDimensions: GEMMDimensions(M: M, N: N, K: K), blockDimensions: blockDimensions, transpose: (left: false, right: true), bias: true, executionSIMDGroups: 4), options: nil)
+      let source = createSource(matrixDimensions: GEMMDimensions(M: M, N: N, K: K), blockDimensions: blockDimensions, transpose: (left: false, right: true), bias: true, executionSIMDGroups: 4)
+      print(source)
+      library = try device.makeLibrary(source: source, options: nil)
     } catch {
       fatalError("Could not create library: \(error).")
     }
