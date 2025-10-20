@@ -70,7 +70,7 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
   let aTileLastKSize: String
   if transpose.left {
     aSlice = "\(blockDimensions.M), \(blockDimensions.K)"
-    aMatrixSize = "\(matrixDimensions.M), \(matrixDimensions.K)"
+    aMatrixSize = "M, \(matrixDimensions.K)"
     aTile0Size = "tgid.y * \(blockDimensions.M), 0"
     aTileK1Size = "tgid.y * \(blockDimensions.M), k"
     aTileK2Size = "tgid.y * \(blockDimensions.M), k + \(blockDimensions.K)"
@@ -79,7 +79,7 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
     aResidualSlice = "\(blockDimensions.M), \(matrixDimensions.K % (blockDimensions.K * 2))"
   } else {
     aSlice = "\(blockDimensions.K), \(blockDimensions.M)"
-    aMatrixSize = "\(matrixDimensions.K), \(matrixDimensions.M)"
+    aMatrixSize = "\(matrixDimensions.K), M"
     aTile0Size = "0, tgid.y * \(blockDimensions.M)"
     aTileK1Size = "k, tgid.y * \(blockDimensions.M)"
     aTileK2Size = "k + \(blockDimensions.K), tgid.y * \(blockDimensions.M)"
@@ -97,7 +97,7 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
   let bTileLastKSize: String
   if transpose.right {
     bSlice = "\(blockDimensions.K), \(blockDimensions.N)"
-    bMatrixSize = "\(matrixDimensions.K), \(matrixDimensions.N)"
+    bMatrixSize = "\(matrixDimensions.K), N"
     bTile0Size = "0, tgid.x * \(blockDimensions.N)"
     bTileK1Size = "k, tgid.x * \(blockDimensions.N)"
     bTileK2Size = "k + \(blockDimensions.K), tgid.x * \(blockDimensions.N)"
@@ -106,7 +106,7 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
     bResidualSlice = "\(matrixDimensions.K % (blockDimensions.K * 2)), \(blockDimensions.N)"
   } else {
     bSlice = "\(blockDimensions.N), \(blockDimensions.K)"
-    bMatrixSize = "\(matrixDimensions.N), \(matrixDimensions.K)"
+    bMatrixSize = "N, \(matrixDimensions.K)"
     bTile0Size = "tgid.x * \(blockDimensions.N), 0"
     bTileK1Size = "tgid.x * \(blockDimensions.N), k"
     bTileK2Size = "tgid.x * \(blockDimensions.N), k + \(blockDimensions.K)"
@@ -123,17 +123,16 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
   let splitKPrologue: String
   var streamKLoop: String
   let splitKStoreOffset: String
-  let splitKGatedRun: String
   if buildOptions.splitK > 1 {
     if buildOptions.swapMN {
       splitKPrologue = """
-  const uint k_split_idx = tgid.x / \((matrixDimensions.M + blockDimensions.M - 1) / blockDimensions.M);
-  tgid.x = tgid.x % \((matrixDimensions.M + blockDimensions.M - 1) / blockDimensions.M);
+  const uint k_split_idx = tgid.x / ((M + \(blockDimensions.M - 1)) / \(blockDimensions.M));
+  tgid.x = tgid.x % ((M + \(blockDimensions.M - 1)) / \(blockDimensions.M));
 """
     } else {
       splitKPrologue = """
-  const uint k_split_idx = tgid.x / \((matrixDimensions.N + blockDimensions.N - 1) / blockDimensions.N);
-  tgid.x = tgid.x % \((matrixDimensions.N + blockDimensions.N - 1) / blockDimensions.N);
+  const uint k_split_idx = tgid.x / ((N + \(blockDimensions.N - 1)) / \(blockDimensions.N));
+  tgid.x = tgid.x % ((N + \(blockDimensions.N - 1)) / \(blockDimensions.N));
 """
     }
     let kPart = matrixDimensions.K / buildOptions.splitK / (blockDimensions.K * 2) * blockDimensions.K * 2
@@ -184,11 +183,6 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
     }
 """
     splitKStoreOffset = "tgid.x * \(blockDimensions.N * buildOptions.splitK) + k_split_idx * \(blockDimensions.N)"
-    splitKGatedRun = """
-    if (k_split_idx == 0) {
-      matmul_op.run(mA, mB, cT);
-    }
-"""
   } else {
     splitKPrologue = ""
     streamKLoop = """
@@ -204,9 +198,6 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
     }
 """
     splitKStoreOffset = "tgid.x * \(blockDimensions.N)"
-    splitKGatedRun = """
-    matmul_op.run(mA, mB, cT);
-"""
   }
   return """
 
@@ -218,6 +209,9 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
 using namespace metal;
 using namespace mpp::tensor_ops;
 
+constant uint M [[function_constant(0)]];
+constant uint N [[function_constant(1)]];
+
 kernel void matmul(device half *A_buf [[buffer(0)]],
                    device half *B_buf [[buffer(1)]],
                    device half *C_buf [[buffer(2)]], \(biasInputTerm)
@@ -226,11 +220,11 @@ kernel void matmul(device half *A_buf [[buffer(0)]],
   // Construct shader allocated tensors. This is easier since we can just bind buffer directly with Metal 3 APIs.
   auto A = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(A_buf, dextents<int32_t, 2>(\(aMatrixSize)));
   auto B = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(B_buf, dextents<int32_t, 2>(\(bMatrixSize)));
-  auto C = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(C_buf, dextents<int32_t, 2>(\(matrixDimensions.N * max(buildOptions.splitK, 1)), \(matrixDimensions.M)));
+  auto C = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(C_buf, dextents<int32_t, 2>(N * \(max(buildOptions.splitK, 1)), M));
 \(splitKPrologue)
 \(swapXY)
 
-  if (tgid.x * \(blockDimensions.N) + \(blockDimensions.N - 1) < \(matrixDimensions.N) && tgid.y * \(blockDimensions.M) + \(blockDimensions.M - 1) < \(matrixDimensions.M)) {
+  if (tgid.x * \(blockDimensions.N) + \(blockDimensions.N - 1) < N && tgid.y * \(blockDimensions.M) + \(blockDimensions.M - 1) < M) {
     // Use static slice.
     // descriptor to create matmul operation that does \(blockDimensions.K)x\(blockDimensions.M) times \(blockDimensions.N)x\(blockDimensions.K) producing \(blockDimensions.N)x\(blockDimensions.M)
     constexpr auto matmulDescriptor = matmul2d_descriptor(\(blockDimensions.M), \(blockDimensions.N), \(blockDimensions.K), \(transpose.left ? "true" : "false"), \(transpose.right ? "true" : "false"), false, matmul2d_descriptor::mode::multiply_accumulate);
@@ -270,16 +264,31 @@ kernel void matmul(device half *A_buf [[buffer(0)]],
     auto mB = B.slice(\(bTile0Size));
     auto cT = matmul_op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), half>();
 \(initializeC)
-\(splitKGatedRun)
-    auto mC = C.slice(\(splitKStoreOffset), tgid.y * \(blockDimensions.M));
+    matmul_op.run(mA, mB, cT);
+    auto mC = C.slice(tgid.x * \(blockDimensions.N), tgid.y * \(blockDimensions.M));
     cT.store(mC);
   }
 }
 
-kernel void reduction(device half *A_buf [[buffer(0)]],
+kernel void reduce_sum_2(device half2 *A_buf [[buffer(0)]],
+                      device half2 *B_buf [[buffer(1)]],
+                   uint2 tpig [[thread_position_in_grid]]) {
+  if (tpig.x >= M * N / 2) {
+    return;
+  }
+  A_buf += tpig.x / \(blockDimensions.N / 2) * \(blockDimensions.N / 2 * max(1, buildOptions.splitK)) + tpig.x % \(blockDimensions.N / 2);
+  auto val = A_buf[0];
+  #pragma clang loop unroll(full)
+  for (unsigned short k = 1; k < \(buildOptions.splitK); k++) {
+    val += A_buf[k * \(blockDimensions.N / 2)];
+  }
+  B_buf[tpig.x] = val;
+}
+
+kernel void reduce_sum(device half *A_buf [[buffer(0)]],
                       device half *B_buf [[buffer(1)]],
                    uint2 tpig [[thread_position_in_grid]]) {
-  if (tpig.x >= \(matrixDimensions.M * matrixDimensions.N)) {
+  if (tpig.x >= M * N) {
     return;
   }
   A_buf += tpig.x / \(blockDimensions.N) * \(blockDimensions.N * max(1, buildOptions.splitK)) + tpig.x % \(blockDimensions.N);
@@ -335,9 +344,13 @@ struct matmul {
       fatalError("Could not create library: \(error).")
     }
 
-
+    let constants = MTLFunctionConstantValues()
+    var constantM: UInt32 = UInt32(M)
+    var constantN: UInt32 = UInt32(N)
+    constants.setConstantValue(&constantM, type: .uint, index: 0)
+    constants.setConstantValue(&constantN, type: .uint, index: 1)
     // 4. Create a function object
-    guard let matmulFunction = library.makeFunction(name: "matmul") else {
+    guard let matmulFunction = try? library.makeFunction(name: "matmul", constantValues: constants) else {
       fatalError("Could not create function")
     }
 
@@ -409,7 +422,7 @@ struct matmul {
     }
     computeCommandEncoder.endEncoding()
     if buildOptions.splitK > 1 {
-      guard let reductionFunction = library.makeFunction(name: "reduction") else {
+      guard let reductionFunction = try? library.makeFunction(name: "reduce_sum_2", constantValues: constants) else {
         fatalError("Could not create function")
       }
       let pipelineState: MTLComputePipelineState
@@ -426,7 +439,7 @@ struct matmul {
       reductionCommandEncoder.setBuffer(bufferC, offset: 0, index: 1)
       reductionCommandEncoder.useResource(bufferC!, usage: [.write, .read])
       let threadsPerThreadgroup = MTLSize(width: 256, height: 1, depth: 1)
-      let threadgroups = MTLSize(width: (M * N + 255) / 256, height: 1, depth: 1)
+      let threadgroups = MTLSize(width: (M * N / 2 + 255) / 256, height: 1, depth: 1)
       for _ in 0..<duplicatedCount {
         reductionCommandEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
       }
