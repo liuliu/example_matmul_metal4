@@ -70,22 +70,22 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
   let aTileLastKSize: String
   if transpose.left {
     aSlice = "\(blockDimensions.M), \(blockDimensions.K)"
-    aMatrixSize = "M, \(matrixDimensions.K)"
+    aMatrixSize = "M, K"
     aTile0Size = "tgid.y * \(blockDimensions.M), 0"
     aTileK1Size = "tgid.y * \(blockDimensions.M), k"
     aTileK2Size = "tgid.y * \(blockDimensions.M), k + \(blockDimensions.K)"
-    aTileLastK2Size = "tgid.y * \(blockDimensions.M), \((matrixDimensions.K / blockDimensions.K - 1) * blockDimensions.K)"
-    aTileLastKSize = "tgid.y * \(blockDimensions.M), \(matrixDimensions.K / (blockDimensions.K * 2) * (blockDimensions.K * 2))"
-    aResidualSlice = "\(blockDimensions.M), \(matrixDimensions.K % (blockDimensions.K * 2))"
+    aTileLastK2Size = "tgid.y * \(blockDimensions.M), K / \(blockDimensions.K * 2) * \(blockDimensions.K * 2)"
+    aTileLastKSize = "tgid.y * \(blockDimensions.M), K / \(blockDimensions.K) * \(blockDimensions.K)"
+    aResidualSlice = "\(blockDimensions.M), dynamic_extent"
   } else {
     aSlice = "\(blockDimensions.K), \(blockDimensions.M)"
-    aMatrixSize = "\(matrixDimensions.K), M"
+    aMatrixSize = "K, M"
     aTile0Size = "0, tgid.y * \(blockDimensions.M)"
     aTileK1Size = "k, tgid.y * \(blockDimensions.M)"
     aTileK2Size = "k + \(blockDimensions.K), tgid.y * \(blockDimensions.M)"
-    aTileLastK2Size = "\((matrixDimensions.K / blockDimensions.K - 1) * blockDimensions.K), tgid.y * \(blockDimensions.M)"
-    aTileLastKSize = "\(matrixDimensions.K / (blockDimensions.K * 2) * (blockDimensions.K * 2)), tgid.y * \(blockDimensions.M)"
-    aResidualSlice = "\(matrixDimensions.K % (blockDimensions.K * 2)), \(blockDimensions.M)"
+    aTileLastK2Size = "K / \(blockDimensions.K * 2) * \(blockDimensions.K * 2), tgid.y * \(blockDimensions.M)"
+    aTileLastKSize = "K / \(blockDimensions.K) * \(blockDimensions.K), tgid.y * \(blockDimensions.M)"
+    aResidualSlice = "dynamic_extent, \(blockDimensions.M)"
   }
   let bSlice: String
   let bMatrixSize: String
@@ -97,22 +97,22 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
   let bTileLastKSize: String
   if transpose.right {
     bSlice = "\(blockDimensions.K), \(blockDimensions.N)"
-    bMatrixSize = "\(matrixDimensions.K), N"
+    bMatrixSize = "K, N"
     bTile0Size = "0, tgid.x * \(blockDimensions.N)"
     bTileK1Size = "k, tgid.x * \(blockDimensions.N)"
     bTileK2Size = "k + \(blockDimensions.K), tgid.x * \(blockDimensions.N)"
-    bTileLastK2Size = "\((matrixDimensions.K / blockDimensions.K - 1) * blockDimensions.K), tgid.x * \(blockDimensions.N)"
-    bTileLastKSize = "\(matrixDimensions.K / (blockDimensions.K * 2) * (blockDimensions.K * 2)), tgid.x * \(blockDimensions.N)"
-    bResidualSlice = "\(matrixDimensions.K % (blockDimensions.K * 2)), \(blockDimensions.N)"
+    bTileLastK2Size = "K / \(blockDimensions.K * 2) * \(blockDimensions.K * 2), tgid.x * \(blockDimensions.N)"
+    bTileLastKSize = "K / \(blockDimensions.K) * \(blockDimensions.K), tgid.x * \(blockDimensions.N)"
+    bResidualSlice = "dynamic_extent, \(blockDimensions.N)"
   } else {
     bSlice = "\(blockDimensions.N), \(blockDimensions.K)"
-    bMatrixSize = "N, \(matrixDimensions.K)"
+    bMatrixSize = "N, K"
     bTile0Size = "tgid.x * \(blockDimensions.N), 0"
     bTileK1Size = "tgid.x * \(blockDimensions.N), k"
     bTileK2Size = "tgid.x * \(blockDimensions.N), k + \(blockDimensions.K)"
-    bTileLastK2Size = "tgid.x * \(blockDimensions.N), \((matrixDimensions.K / blockDimensions.K - 1) * blockDimensions.K)"
-    bTileLastKSize = "tgid.x * \(blockDimensions.N), \(matrixDimensions.K / (blockDimensions.K * 2) * (blockDimensions.K * 2))"
-    bResidualSlice = "\(blockDimensions.N), \(matrixDimensions.K % (blockDimensions.K * 2))"
+    bTileLastK2Size = "tgid.x * \(blockDimensions.N), K / \(blockDimensions.K * 2) * \(blockDimensions.K * 2)"
+    bTileLastKSize = "tgid.x * \(blockDimensions.N), K / \(blockDimensions.K) * \(blockDimensions.K)"
+    bResidualSlice = "\(blockDimensions.N), dynamic_extent"
   }
   let swapXY: String
   if buildOptions.swapMN {
@@ -135,11 +135,10 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
   tgid.x = tgid.x % ((N + \(blockDimensions.N - 1)) / \(blockDimensions.N));
 """
     }
-    let kPart = matrixDimensions.K / buildOptions.splitK / (blockDimensions.K * 2) * blockDimensions.K * 2
     streamKLoop = """
     if (k_split_idx == 0) {
       #pragma clang loop unroll(full)
-      for (ushort k = 0; k < \(kPart); k += \(blockDimensions.K * 2)) {
+      for (ushort k = 0; k < K_split; k += \(blockDimensions.K * 2)) {
         // Create appropriate slice for this thread group to work on.
         auto mA0 = A.slice<\(aSlice)>(\(aTileK1Size));
         auto mB0 = B.slice<\(bSlice)>(\(bTileK1Size));
@@ -155,7 +154,7 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
         streamKLoop += """
         else if (k_split_idx == \(k)) {
           #pragma clang loop unroll(full)
-          for (ushort k = \(k * kPart); k < \((k + 1) * kPart); k += \(blockDimensions.K * 2)) {
+          for (ushort k = \(k) * K_split; k < \(k + 1) * K_split; k += \(blockDimensions.K * 2)) {
             // Create appropriate slice for this thread group to work on.
             auto mA0 = A.slice<\(aSlice)>(\(aTileK1Size));
             auto mB0 = B.slice<\(bSlice)>(\(bTileK1Size));
@@ -171,7 +170,7 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
     streamKLoop += """
     else {
       #pragma clang loop unroll(full)
-      for (ushort k = \((buildOptions.splitK - 1) * kPart); k < \(max(0, matrixDimensions.K - (blockDimensions.K * 2) + 1)); k += \(blockDimensions.K * 2)) {
+      for (ushort k = \(buildOptions.splitK - 1) * K_split; k < K_edge; k += \(blockDimensions.K * 2)) {
         // Create appropriate slice for this thread group to work on.
         auto mA0 = A.slice<\(aSlice)>(\(aTileK1Size));
         auto mB0 = B.slice<\(bSlice)>(\(bTileK1Size));
@@ -187,7 +186,7 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
     splitKPrologue = ""
     streamKLoop = """
     #pragma clang loop unroll(full)
-    for (ushort k = 0; k < \(max(0, matrixDimensions.K - (blockDimensions.K * 2) + 1)); k += \(blockDimensions.K * 2)) {
+    for (ushort k = 0; k < K_edge; k += \(blockDimensions.K * 2)) {
       // Create appropriate slice for this thread group to work on.
       auto mA0 = A.slice<\(aSlice)>(\(aTileK1Size));
       auto mB0 = B.slice<\(bSlice)>(\(bTileK1Size));
@@ -211,6 +210,10 @@ using namespace mpp::tensor_ops;
 
 constant uint M [[function_constant(0)]];
 constant uint N [[function_constant(1)]];
+constant uint K [[function_constant(2)]];
+
+constant uint K_split = K / \(buildOptions.splitK) / \(blockDimensions.K * 2) * \(blockDimensions.K * 2);
+constant uint K_edge = K > \(blockDimensions.K * 2) - 1 ? K + 1 - \(blockDimensions.K * 2) : 0;
 
 kernel void matmul(device half *A_buf [[buffer(0)]],
                    device half *B_buf [[buffer(1)]],
@@ -237,14 +240,13 @@ kernel void matmul(device half *A_buf [[buffer(0)]],
     auto cT = matmul_op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), half>();
 \(initializeC)
 \(streamKLoop)
-    if (\((matrixDimensions.K % (blockDimensions.K * 2) != 0) && (matrixDimensions.K % (blockDimensions.K) == 0) ? "true" : "false")) {
+    if (K % \(blockDimensions.K * 2) >= \(blockDimensions.K)) {
       auto mA = A.slice<\(aSlice)>(\(aTileLastK2Size));
       auto mB = B.slice<\(bSlice)>(\(bTileLastK2Size));
       matmul_op.run(mA, mB, cT);
     }
-    if (\((matrixDimensions.K % blockDimensions.K != 0) ? "true" : "false")) {
-      constexpr auto matmulDescriptor = matmul2d_descriptor(\(blockDimensions.M), \(blockDimensions.N), \(matrixDimensions.K % (blockDimensions.K * 2)), \(transpose.left ? "true" : "false"), \(transpose.right ? "true" : "false"), false, matmul2d_descriptor::mode::multiply_accumulate);
-      // create matmul op from above descriptor with \(buildOptions.executionSIMDGroups) SIMD-Groups.
+    if (K % \(blockDimensions.K) != 0) {
+      constexpr auto matmulDescriptor = matmul2d_descriptor(\(blockDimensions.M), \(blockDimensions.N), dynamic_length_v<int>, \(transpose.left ? "true" : "false"), \(transpose.right ? "true" : "false"), false, matmul2d_descriptor::mode::multiply_accumulate);
       matmul2d<matmulDescriptor, execution_simdgroups<\(buildOptions.executionSIMDGroups)>> matmul_op;
       auto mA = A.slice<\(aResidualSlice)>(\(aTileLastKSize));
       auto mB = B.slice<\(bResidualSlice)>(\(bTileLastKSize));
@@ -306,8 +308,8 @@ kernel void reduce_sum(device half *A_buf [[buffer(0)]],
 @main
 struct matmul {
   static func main() {
-    // profileCorrectness()
-    run(M: 3072, N: 3072, K: 3072, blockDimensions: GEMMDimensions(M: 128, N: 64, K: 64), buildOptions: BuildOptions(executionSIMDGroups: 4, swapMN: true, splitK: 2), duplicatedCount: 1)
+    profileCorrectness()
+    // run(M: 3072, N: 3072, K: 3072, blockDimensions: GEMMDimensions(M: 128, N: 64, K: 64), buildOptions: BuildOptions(executionSIMDGroups: 4, swapMN: true, splitK: 2), duplicatedCount: 1)
   }
   
   static func profileCorrectness() {
@@ -347,8 +349,10 @@ struct matmul {
     let constants = MTLFunctionConstantValues()
     var constantM: UInt32 = UInt32(M)
     var constantN: UInt32 = UInt32(N)
+    var constantK: UInt32 = UInt32(K)
     constants.setConstantValue(&constantM, type: .uint, index: 0)
     constants.setConstantValue(&constantN, type: .uint, index: 1)
+    constants.setConstantValue(&constantK, type: .uint, index: 2)
     // 4. Create a function object
     guard let matmulFunction = try? library.makeFunction(name: "matmul", constantValues: constants) else {
       fatalError("Could not create function")
