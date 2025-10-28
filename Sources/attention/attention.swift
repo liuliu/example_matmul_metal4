@@ -36,21 +36,21 @@ constant uint K [[function_constant(2)]];
 kernel void attention(device half *Q_buf [[buffer(0)]],
                       device half *K_buf [[buffer(1)]],
                       device half *V_buf [[buffer(2)]],
-                      device float *O_buf [[buffer(3)]],
+                      device half *O_buf [[buffer(3)]],
                       threadgroup uchar *threadgroup_block [[threadgroup(0)]],
-                      ushort sid [[simdgroup_index_in_threadgroup]],
+                      ushort sgid [[simdgroup_index_in_threadgroup]],
                       uint2 tgid [[threadgroup_position_in_grid]])
 {
   auto Q = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(Q_buf, dextents<int32_t, 2>(\(attentionDimensions.K), \(attentionDimensions.R)));
   auto K = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(K_buf, dextents<int32_t, 2>(\(attentionDimensions.K), \(attentionDimensions.C)));
   auto V = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(V_buf, dextents<int32_t, 2>(\(attentionDimensions.K), \(attentionDimensions.C)));
-  auto O = tensor<device float,  dextents<int32_t, 2>, tensor_inline>(O_buf, dextents<int32_t, 2>(\(attentionDimensions.K), \(attentionDimensions.R)));
-  threadgroup half *P_buf = (threadgroup half*)threadgroup_block + \(blockDimensions.C) * \(blockDimensions.R) * sid;
+  threadgroup half *P_buf = (threadgroup half*)threadgroup_block + \(blockDimensions.C) * \(blockDimensions.R) * sgid;
   auto P = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(P_buf, dextents<int32_t, 2>(\(blockDimensions.C), \(blockDimensions.R)));
   constexpr auto qk_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(blockDimensions.K), false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<qk_desc, execution_simdgroups<1>> matmul_qk_op;
 
-  auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(0, (tgid.x * \(buildOptions.executionSIMDGroups) + sid) * \(blockDimensions.R));
+  tgid.x = tgid.x * \(buildOptions.executionSIMDGroups) + sgid;
+  auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(0, tgid.x * \(blockDimensions.R));
   auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(0, 0);
   auto cS = matmul_qk_op.get_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
   auto cM = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
@@ -78,7 +78,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     }
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < \(attentionDimensions.K); k += \(blockDimensions.K)) {
-      auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(k, (tgid.x * \(buildOptions.executionSIMDGroups) + sid) * \(blockDimensions.R));
+      auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(k, tgid.x * \(blockDimensions.R));
       auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(k, c);
       matmul_qk_op.run(mQ, mK, cS);
     }
@@ -155,10 +155,15 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       cO_1[k] *= L_reciprocal;
     }
   }
-  auto mO_0 = O.slice<\(blockDimensions.K), \(blockDimensions.R)>(0, (tgid.x * \(buildOptions.executionSIMDGroups) + sid) * \(blockDimensions.R));
-  cO_0.store(mO_0);
-  auto mO_1 = O.slice<\(blockDimensions.K), \(blockDimensions.R)>(\(blockDimensions.K), (tgid.x * \(buildOptions.executionSIMDGroups) + sid) * \(blockDimensions.R));
-  cO_1.store(mO_1);
+  auto O = O_buf + tgid.x * \(blockDimensions.R) * \(attentionDimensions.K);
+  #pragma clang loop unroll(full)
+  for (unsigned short k = 0; k < cO_0.get_capacity(); ++k) {
+    if (cO_0.is_valid_element(k)) {
+      auto idx = cO_0.get_multidimensional_index(k);
+      O[idx[0] + idx[1] * \(attentionDimensions.K)] = (half)cO_0[k];
+      O[idx[0] + idx[1] * \(attentionDimensions.K) + \(blockDimensions.K)] = (half)cO_1[k];
+    }
+  }
 }
 """
 }
@@ -221,7 +226,7 @@ struct attention {
     let bufferQ = device.makeBuffer(length: sizeQ, options: .storageModeShared)
     let bufferK = device.makeBuffer(length: sizeK, options: .storageModeShared)
     let bufferV = device.makeBuffer(length: sizeV, options: .storageModeShared)
-    let bufferO = device.makeBuffer(length: sizeQ * 2, options: .storageModeShared)
+    let bufferO = device.makeBuffer(length: sizeQ, options: .storageModeShared)
 
     let Q: [Float16] = network.Q.map { Float16($0) }
     let K: [Float16] = network.K.map { Float16($0) }
@@ -272,8 +277,8 @@ struct attention {
     let gflops = Int(Double(operations) / Double(latency) / 1e9)
     print("GFlops: \(gflops)")
     // 10. Read the results
-    var resultO = [Float](repeating: 0, count: sequenceDimension * headDimension)
-    let resultBufferPointer = bufferO?.contents().bindMemory(to: Float.self, capacity: sequenceDimension * headDimension)
+    var resultO = [Float16](repeating: 0, count: sequenceDimension * headDimension)
+    let resultBufferPointer = bufferO?.contents().bindMemory(to: Float16.self, capacity: sequenceDimension * headDimension)
 
     if let ptr = resultBufferPointer {
       resultO = Array(UnsafeBufferPointer(start: ptr, count: sequenceDimension * headDimension))

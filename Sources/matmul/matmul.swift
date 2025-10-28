@@ -203,14 +203,14 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
   if buildOptions.preemptiveExecutionSIMDGroups > 1 {
     if buildOptions.swapMN {
       updateTgidX = """
-  tgid.x = tgid.x * \(buildOptions.preemptiveExecutionSIMDGroups) + sid;
+  tgid.x = tgid.x * \(buildOptions.preemptiveExecutionSIMDGroups) + sgid;
   if (tgid.x * \(blockDimensions.M) >= M) {
     return;
   }
 """
     } else {
       updateTgidX = """
-  tgid.x = tgid.x * \(buildOptions.preemptiveExecutionSIMDGroups) + sid;
+  tgid.x = tgid.x * \(buildOptions.preemptiveExecutionSIMDGroups) + sgid;
   if (tgid.x * \(blockDimensions.N) >= N) {
     return;
   }
@@ -239,7 +239,7 @@ constant uint K_edge = K > \(blockDimensions.K * 2) - 1 ? K + 1 - \(blockDimensi
 kernel void matmul(device half *A_buf [[buffer(0)]],
                    device half *B_buf [[buffer(1)]],
                    device half *C_buf [[buffer(2)]], \(biasInputTerm)
-                   ushort sid [[simdgroup_index_in_threadgroup]],
+                   ushort sgid [[simdgroup_index_in_threadgroup]],
                    uint2 tgid [[threadgroup_position_in_grid]])
 {
   // Construct shader allocated tensors. This is easier since we can just bind buffer directly with Metal 3 APIs.
