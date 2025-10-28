@@ -73,7 +73,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
   constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), \(blockDimensions.C), false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<pv_desc, execution_simdgroups<1>> matmul_pv_op;
   auto cO_0 = matmul_pv_op.get_destination_cooperative_tensor<decltype(P), decltype(mV), float>();
-  auto cO_1 = matmul_pv_op.get_destination_cooperative_tensor<decltype(P), decltype(mV), float>();
+  // auto cO_1 = matmul_pv_op.get_destination_cooperative_tensor<decltype(P), decltype(mV), float>();
   for (uint c = 0; c < \(attentionDimensions.C); c += \(blockDimensions.C) * 2) {
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
@@ -133,7 +133,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       for (unsigned short k = 0; k < cO_0.get_capacity(); ++k) {
         if (cO_0.is_valid_element(k)) {
           cO_0[k] = 0;
-          cO_1[k] = 0;
+          // cO_1[k] = 0;
         }
       }
     } else {
@@ -143,7 +143,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
           auto it = cO_0.get_iterator(k);
           auto dst_it = correction.map_iterator(it);
           cO_0[k] *= *dst_it;
-          cO_1[k] *= *dst_it;
+          // cO_1[k] *= *dst_it;
         }
       }
     }
@@ -156,9 +156,9 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
     auto mV_0_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), c);
-    auto mV_0_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(blockDimensions.K), c);
+    // auto mV_0_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(blockDimensions.K), c);
     matmul_pv_op.run(P, mV_0_0, cO_0);
-    matmul_pv_op.run(P, mV_0_1, cO_1);
+    // matmul_pv_op.run(P, mV_0_1, cO_1);
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cS_1.get_capacity(); ++k) {
       if(cS_1.is_valid_element(k)) {
@@ -168,9 +168,9 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
     auto mV_1_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), c + \(blockDimensions.C));
-    auto mV_1_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(blockDimensions.K), c + \(blockDimensions.C));
+    // auto mV_1_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(blockDimensions.K), c + \(blockDimensions.C));
     matmul_pv_op.run(P, mV_1_0, cO_0);
-    matmul_pv_op.run(P, mV_1_1, cO_1);
+    // matmul_pv_op.run(P, mV_1_1, cO_1);
   }
   #pragma clang loop unroll(full)
   for (unsigned short k = 0; k < cO_0.get_capacity(); ++k) {
@@ -179,7 +179,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       auto dst_it = cL.map_iterator(it);
       auto L_reciprocal = fast::divide(1, *dst_it);
       cO_0[k] *= L_reciprocal;
-      cO_1[k] *= L_reciprocal;
+      // cO_1[k] *= L_reciprocal;
     }
   }
   auto O = O_buf + tgid.x * \(blockDimensions.R) * \(attentionDimensions.K) + tgid.y * \(attentionDimensions.K);
@@ -188,7 +188,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     if (cO_0.is_valid_element(k)) {
       auto idx = cO_0.get_multidimensional_index(k);
       O[idx[0] + idx[1] * \(attentionDimensions.K)] = (half)cO_0[k];
-      O[idx[0] + idx[1] * \(attentionDimensions.K) + \(blockDimensions.K)] = (half)cO_1[k];
+      // O[idx[0] + idx[1] * \(attentionDimensions.K) + \(blockDimensions.K)] = (half)cO_1[k];
     }
   }
 }
@@ -217,10 +217,10 @@ struct attention {
       fatalError("Could not create command queue")
     }
 
-    let blockDimensions = BlockDimenions(R: 16, C: 64, K: 64)
+    let blockDimensions = BlockDimenions(R: 16, C: 64, K: 128)
     let library: MTLLibrary
     do {
-      let source = createSource(blockDimensions: blockDimensions, attentionDimensions: AttentionDimensions(R: sequenceDimension, C: sequenceDimension, K: 128, Hq: Hq, Hk: Hk), buildOptions: buildOptions)
+      let source = createSource(blockDimensions: blockDimensions, attentionDimensions: AttentionDimensions(R: sequenceDimension, C: sequenceDimension, K: headDimension, Hq: Hq, Hk: Hk), buildOptions: buildOptions)
       library = try device.makeLibrary(source: source, options: nil)
     } catch {
       fatalError("Could not create library: \(error).")
