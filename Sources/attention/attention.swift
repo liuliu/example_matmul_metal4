@@ -15,6 +15,8 @@ struct AttentionDimensions {
   var R: Int
   var C: Int
   var K: Int
+  var Hq: Int
+  var Hk: Int
 }
 
 func createSource(blockDimensions: BlockDimenions, attentionDimensions: AttentionDimensions, buildOptions: BuildOptions) -> String {
@@ -41,17 +43,20 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
                       ushort sgid [[simdgroup_index_in_threadgroup]],
                       uint2 tgid [[threadgroup_position_in_grid]])
 {
-  auto Q = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(Q_buf, dextents<int32_t, 2>(\(attentionDimensions.K), \(attentionDimensions.R)));
-  auto K = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(K_buf, dextents<int32_t, 2>(\(attentionDimensions.K), \(attentionDimensions.C)));
-  auto V = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(V_buf, dextents<int32_t, 2>(\(attentionDimensions.K), \(attentionDimensions.C)));
+  tgid = { tgid.x / \(attentionDimensions.Hq), tgid.x % \(attentionDimensions.Hq) };
+  tgid.x = tgid.x * \(buildOptions.executionSIMDGroups) + sgid;
+  if (tgid.x * \(blockDimensions.R) >= \(attentionDimensions.R)) {
+    return;
+  }
+  auto Q = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(Q_buf, dextents<int32_t, 2>(\(attentionDimensions.K * attentionDimensions.Hq), \(attentionDimensions.R)));
+  auto K = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(K_buf, dextents<int32_t, 2>(\(attentionDimensions.K * attentionDimensions.Hk), \(attentionDimensions.C)));
+  auto V = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(V_buf, dextents<int32_t, 2>(\(attentionDimensions.K * attentionDimensions.Hk), \(attentionDimensions.C)));
   threadgroup half *P_buf = (threadgroup half*)threadgroup_block + \(blockDimensions.C) * \(blockDimensions.R) * sgid;
   auto P = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(P_buf, dextents<int32_t, 2>(\(blockDimensions.C), \(blockDimensions.R)));
-  constexpr auto qk_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(blockDimensions.K), false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto qk_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(blockDimensions.K), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<qk_desc, execution_simdgroups<1>> matmul_qk_op;
-
-  tgid.x = tgid.x * \(buildOptions.executionSIMDGroups) + sgid;
-  auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(0, tgid.x * \(blockDimensions.R));
-  auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(0, 0);
+  auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K), tgid.x * \(blockDimensions.R));
+  auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), 0);
   auto cS = matmul_qk_op.get_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
   auto cM = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
   auto cL = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
@@ -65,11 +70,11 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
   }
   auto mP = P.slice<\(blockDimensions.C), \(blockDimensions.R)>(0, 0);
   auto mV = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(0, 0);
-  constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), \(blockDimensions.C), false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), \(blockDimensions.C), false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<pv_desc, execution_simdgroups<1>> matmul_pv_op;
   auto cO_0 = matmul_pv_op.get_destination_cooperative_tensor<decltype(mP), decltype(mV), float>();
   auto cO_1 = matmul_pv_op.get_destination_cooperative_tensor<decltype(mP), decltype(mV), float>();
-  for (uint c = 0; c < \(attentionDimensions.C); c += \(blockDimensions.C)) {
+  for (uint c = 0; c < \(attentionDimensions.C); c += \(blockDimensions.C) * 2) {
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cS.get_capacity(); ++k) {
       if (cS.is_valid_element(k)) {
@@ -78,8 +83,8 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     }
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < \(attentionDimensions.K); k += \(blockDimensions.K)) {
-      auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(k, tgid.x * \(blockDimensions.R));
-      auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(k, c);
+      auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K) + k, tgid.x * \(blockDimensions.R));
+      auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c);
       matmul_qk_op.run(mQ, mK, cS);
     }
     // Online reduce maximum.
@@ -140,8 +145,8 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
     auto mP = P.slice<\(blockDimensions.C), \(blockDimensions.R)>(0, 0);
-    auto mV_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(0, c);
-    auto mV_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(\(blockDimensions.K), c);
+    auto mV_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), c);
+    auto mV_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(blockDimensions.K), c);
     matmul_pv_op.run(mP, mV_0, cO_0);
     matmul_pv_op.run(mP, mV_1, cO_1);
   }
@@ -155,7 +160,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       cO_1[k] *= L_reciprocal;
     }
   }
-  auto O = O_buf + tgid.x * \(blockDimensions.R) * \(attentionDimensions.K);
+  auto O = O_buf + tgid.x * \(blockDimensions.R) * \(attentionDimensions.K) + tgid.y * \(attentionDimensions.K);
   #pragma clang loop unroll(full)
   for (unsigned short k = 0; k < cO_0.get_capacity(); ++k) {
     if (cO_0.is_valid_element(k)) {
@@ -171,10 +176,10 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
 @main
 struct attention {
   static func main() {
-    run(sequenceDimension: 1024, headDimension: 128, buildOptions: BuildOptions(executionSIMDGroups: 4), duplicatedCount: 20)
+    run(sequenceDimension: 1024, headDimension: 128, Hq: 1, Hk: 1, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 20)
   }
 
-  static func run(sequenceDimension: Int, headDimension: Int, buildOptions: BuildOptions, duplicatedCount: Int) {
+  static func run(sequenceDimension: Int, headDimension: Int, Hq: Int, Hk: Int, buildOptions: BuildOptions, duplicatedCount: Int) {
     // 1. Create a reference to the GPU
     guard let device = MTLCreateSystemDefaultDevice() else {
       fatalError("Metal is not supported on this device")
@@ -193,7 +198,7 @@ struct attention {
     let blockDimensions = BlockDimenions(R: 16, C: 64, K: 64)
     let library: MTLLibrary
     do {
-      let source = createSource(blockDimensions: blockDimensions, attentionDimensions: AttentionDimensions(R: sequenceDimension, C: sequenceDimension, K: 128), buildOptions: buildOptions)
+      let source = createSource(blockDimensions: blockDimensions, attentionDimensions: AttentionDimensions(R: sequenceDimension, C: sequenceDimension, K: 128, Hq: Hq, Hk: Hk), buildOptions: buildOptions)
       library = try device.makeLibrary(source: source, options: nil)
     } catch {
       fatalError("Could not create library: \(error).")
@@ -206,8 +211,8 @@ struct attention {
     }
 
     var networkDesc = NetworkDescriptor()
-    networkDesc.rowDimension = sequenceDimension
-    networkDesc.columnDimension = sequenceDimension
+    networkDesc.rowDimension = sequenceDimension * Hq
+    networkDesc.columnDimension = sequenceDimension * Hk
     networkDesc.headDimension = headDimension
     let network = Network(descriptor: networkDesc)
 
@@ -219,9 +224,9 @@ struct attention {
       fatalError("Could not create pipeline state: \(error)")
     }
 
-    let sizeQ = sequenceDimension * headDimension * MemoryLayout<Float16>.size
-    let sizeK = sequenceDimension * headDimension * MemoryLayout<Float16>.size
-    let sizeV = sequenceDimension * headDimension * MemoryLayout<Float16>.size
+    let sizeQ = sequenceDimension * headDimension * Hq * MemoryLayout<Float16>.size
+    let sizeK = sequenceDimension * headDimension * Hk * MemoryLayout<Float16>.size
+    let sizeV = sequenceDimension * headDimension * Hk * MemoryLayout<Float16>.size
 
     let bufferQ = device.makeBuffer(length: sizeQ, options: .storageModeShared)
     let bufferK = device.makeBuffer(length: sizeK, options: .storageModeShared)
