@@ -38,18 +38,19 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
                       device half *V_buf [[buffer(2)]],
                       device float *O_buf [[buffer(3)]],
                       threadgroup uchar *threadgroup_block [[threadgroup(0)]],
+                      ushort sid [[simdgroup_index_in_threadgroup]],
                       uint2 tgid [[threadgroup_position_in_grid]])
 {
   auto Q = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(Q_buf, dextents<int32_t, 2>(\(attentionDimensions.K), \(attentionDimensions.R)));
   auto K = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(K_buf, dextents<int32_t, 2>(\(attentionDimensions.K), \(attentionDimensions.C)));
   auto V = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(V_buf, dextents<int32_t, 2>(\(attentionDimensions.K), \(attentionDimensions.C)));
   auto O = tensor<device float,  dextents<int32_t, 2>, tensor_inline>(O_buf, dextents<int32_t, 2>(\(attentionDimensions.K), \(attentionDimensions.R)));
-  threadgroup half *P_buf = (threadgroup half*)threadgroup_block;
+  threadgroup half *P_buf = (threadgroup half*)threadgroup_block + \(blockDimensions.C) * \(blockDimensions.R) * sid;
   auto P = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(P_buf, dextents<int32_t, 2>(\(blockDimensions.C), \(blockDimensions.R)));
-  constexpr auto qk_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(blockDimensions.K), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto qk_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(blockDimensions.K), false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<qk_desc, execution_simdgroups<1>> matmul_qk_op;
 
-  auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(0, tgid.x * \(blockDimensions.R));
+  auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(0, (tgid.x * \(buildOptions.executionSIMDGroups) + sid) * \(blockDimensions.R));
   auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(0, 0);
   auto cS = matmul_qk_op.get_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
   auto cM = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
@@ -64,7 +65,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
   }
   auto mP = P.slice<\(blockDimensions.C), \(blockDimensions.R)>(0, 0);
   auto mV = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(0, 0);
-  constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), \(blockDimensions.C), false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), \(blockDimensions.C), false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<pv_desc, execution_simdgroups<1>> matmul_pv_op;
   auto cO_0 = matmul_pv_op.get_destination_cooperative_tensor<decltype(mP), decltype(mV), float>();
   auto cO_1 = matmul_pv_op.get_destination_cooperative_tensor<decltype(mP), decltype(mV), float>();
@@ -77,7 +78,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     }
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < \(attentionDimensions.K); k += \(blockDimensions.K)) {
-      auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(k, tgid.x * \(blockDimensions.R));
+      auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(k, (tgid.x * \(buildOptions.executionSIMDGroups) + sid) * \(blockDimensions.R));
       auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(k, c);
       matmul_qk_op.run(mQ, mK, cS);
     }
@@ -137,7 +138,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
         }
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
     auto mP = P.slice<\(blockDimensions.C), \(blockDimensions.R)>(0, 0);
     auto mV_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(0, c);
     auto mV_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(\(blockDimensions.K), c);
@@ -154,9 +155,9 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       cO_1[k] *= L_reciprocal;
     }
   }
-  auto mO_0 = O.slice<\(blockDimensions.K), \(blockDimensions.R)>(0, tgid.x * \(blockDimensions.R));
+  auto mO_0 = O.slice<\(blockDimensions.K), \(blockDimensions.R)>(0, (tgid.x * \(buildOptions.executionSIMDGroups) + sid) * \(blockDimensions.R));
   cO_0.store(mO_0);
-  auto mO_1 = O.slice<\(blockDimensions.K), \(blockDimensions.R)>(\(blockDimensions.K), tgid.x * \(blockDimensions.R));
+  auto mO_1 = O.slice<\(blockDimensions.K), \(blockDimensions.R)>(\(blockDimensions.K), (tgid.x * \(buildOptions.executionSIMDGroups) + sid) * \(blockDimensions.R));
   cO_1.store(mO_1);
 }
 """
@@ -165,7 +166,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
 @main
 struct attention {
   static func main() {
-    run(sequenceDimension: 8192, headDimension: 128, buildOptions: BuildOptions(executionSIMDGroups: 4), duplicatedCount: 20)
+    run(sequenceDimension: 1024, headDimension: 128, buildOptions: BuildOptions(executionSIMDGroups: 4), duplicatedCount: 20)
   }
 
   static func run(sequenceDimension: Int, headDimension: Int, buildOptions: BuildOptions, duplicatedCount: Int) {
@@ -184,7 +185,7 @@ struct attention {
       fatalError("Could not create command queue")
     }
 
-    let blockDimensions = BlockDimenions(R: 16, C: 32, K: 64)
+    let blockDimensions = BlockDimenions(R: 16, C: 64, K: 64)
     let library: MTLLibrary
     do {
       let source = createSource(blockDimensions: blockDimensions, attentionDimensions: AttentionDimensions(R: sequenceDimension, C: sequenceDimension, K: 128), buildOptions: buildOptions)
@@ -244,12 +245,12 @@ struct attention {
     computeCommandEncoder.useResource(bufferK!, usage: .read)
     computeCommandEncoder.useResource(bufferV!, usage: .read)
     computeCommandEncoder.useResource(bufferO!, usage: .write)
-    computeCommandEncoder.setThreadgroupMemoryLength(blockDimensions.R * blockDimensions.C * MemoryLayout<Float16>.size, index: 0)
+    computeCommandEncoder.setThreadgroupMemoryLength(blockDimensions.R * blockDimensions.C * buildOptions.executionSIMDGroups * MemoryLayout<Float16>.size, index: 0)
 
       // 8. Dispatch threads
-    let threadgroups = MTLSize(width: sequenceDimension / blockDimensions.R, height: 1, depth: 1)
+    let threadgroups = MTLSize(width: sequenceDimension / (blockDimensions.R * buildOptions.executionSIMDGroups), height: 1, depth: 1)
     let simdgroupWidth = pipelineState.threadExecutionWidth
-    let threadsPerThreadgroup = MTLSize(width: simdgroupWidth, height: 1, depth: 1)
+    let threadsPerThreadgroup = MTLSize(width: simdgroupWidth * buildOptions.executionSIMDGroups, height: 1, depth: 1)
 
     for _ in 0..<duplicatedCount {
       computeCommandEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
