@@ -9,7 +9,8 @@ struct GEMMDimensions {
 }
 
 struct BuildOptions {
-  var executionSIMDGroups: Int
+  var cooperativeExecutionSIMDGroups: Int
+  var preemptiveExecutionSIMDGroups: Int
   var swapMN: Bool
   var splitK: Int
 }
@@ -198,6 +199,26 @@ func createSource(matrixDimensions: GEMMDimensions, blockDimensions: GEMMDimensi
 """
     splitKStoreOffset = "tgid.x * \(blockDimensions.N)"
   }
+  let updateTgidX: String
+  if buildOptions.preemptiveExecutionSIMDGroups > 1 {
+    if buildOptions.swapMN {
+      updateTgidX = """
+  tgid.x = tgid.x * \(buildOptions.preemptiveExecutionSIMDGroups) + sid;
+  if (tgid.x * \(blockDimensions.M) >= M) {
+    return;
+  }
+"""
+    } else {
+      updateTgidX = """
+  tgid.x = tgid.x * \(buildOptions.preemptiveExecutionSIMDGroups) + sid;
+  if (tgid.x * \(blockDimensions.N) >= N) {
+    return;
+  }
+"""
+    }
+  } else {
+    updateTgidX = ""
+  }
   return """
 
 #include <metal_stdlib>
@@ -218,12 +239,14 @@ constant uint K_edge = K > \(blockDimensions.K * 2) - 1 ? K + 1 - \(blockDimensi
 kernel void matmul(device half *A_buf [[buffer(0)]],
                    device half *B_buf [[buffer(1)]],
                    device half *C_buf [[buffer(2)]], \(biasInputTerm)
+                   ushort sid [[simdgroup_index_in_threadgroup]],
                    uint2 tgid [[threadgroup_position_in_grid]])
 {
   // Construct shader allocated tensors. This is easier since we can just bind buffer directly with Metal 3 APIs.
   auto A = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(A_buf, dextents<int32_t, 2>(\(aMatrixSize)));
   auto B = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(B_buf, dextents<int32_t, 2>(\(bMatrixSize)));
   auto C = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(C_buf, dextents<int32_t, 2>(N * \(max(buildOptions.splitK, 1)), M));
+\(updateTgidX)
 \(splitKPrologue)
 \(swapXY)
 
@@ -232,8 +255,8 @@ kernel void matmul(device half *A_buf [[buffer(0)]],
     // descriptor to create matmul operation that does \(blockDimensions.K)x\(blockDimensions.M) times \(blockDimensions.N)x\(blockDimensions.K) producing \(blockDimensions.N)x\(blockDimensions.M)
     constexpr auto matmulDescriptor = matmul2d_descriptor(\(blockDimensions.M), \(blockDimensions.N), \(blockDimensions.K), \(transpose.left ? "true" : "false"), \(transpose.right ? "true" : "false"), false, matmul2d_descriptor::mode::multiply_accumulate);
 
-    // create matmul op from above descriptor with \(buildOptions.executionSIMDGroups) SIMD-Groups.
-    matmul2d<matmulDescriptor, execution_simdgroups<\(buildOptions.executionSIMDGroups)>> matmul_op;
+    // create matmul op from above descriptor with \(buildOptions.cooperativeExecutionSIMDGroups) SIMD-Groups.
+    matmul2d<matmulDescriptor, execution_simdgroups<\(buildOptions.cooperativeExecutionSIMDGroups)>> matmul_op;
 
     auto mA = A.slice<\(aSlice)>(\(aTile0Size));
     auto mB = B.slice<\(bSlice)>(\(bTile0Size));
@@ -247,7 +270,7 @@ kernel void matmul(device half *A_buf [[buffer(0)]],
     }
     if (K % \(blockDimensions.K) != 0) {
       constexpr auto matmulDescriptor = matmul2d_descriptor(\(blockDimensions.M), \(blockDimensions.N), dynamic_length_v<int>, \(transpose.left ? "true" : "false"), \(transpose.right ? "true" : "false"), false, matmul2d_descriptor::mode::multiply_accumulate);
-      matmul2d<matmulDescriptor, execution_simdgroups<\(buildOptions.executionSIMDGroups)>> matmul_op;
+      matmul2d<matmulDescriptor, execution_simdgroups<\(buildOptions.cooperativeExecutionSIMDGroups)>> matmul_op;
       auto mA = A.slice<\(aResidualSlice)>(\(aTileLastKSize));
       auto mB = B.slice<\(bResidualSlice)>(\(bTileLastKSize));
       matmul_op.run(mA, mB, cT);
@@ -259,8 +282,8 @@ kernel void matmul(device half *A_buf [[buffer(0)]],
     // descriptor to create matmul operation that does \(blockDimensions.K)x\(blockDimensions.M) times \(blockDimensions.N)x\(blockDimensions.K) producing \(blockDimensions.N)x\(blockDimensions.M)
     constexpr auto matmulDescriptor = matmul2d_descriptor(\(blockDimensions.M), \(blockDimensions.N), dynamic_length_v<int>, \(transpose.left ? "true" : "false"), \(transpose.right ? "true" : "false"), false, matmul2d_descriptor::mode::multiply_accumulate);
 
-    // create matmul op from above descriptor with \(buildOptions.executionSIMDGroups) SIMD-Groups.
-    matmul2d<matmulDescriptor, execution_simdgroups<\(buildOptions.executionSIMDGroups)>> matmul_op;
+    // create matmul op from above descriptor with \(buildOptions.cooperativeExecutionSIMDGroups) SIMD-Groups.
+    matmul2d<matmulDescriptor, execution_simdgroups<\(buildOptions.cooperativeExecutionSIMDGroups)>> matmul_op;
 
     auto mA = A.slice(\(aTile0Size));
     auto mB = B.slice(\(bTile0Size));
@@ -315,7 +338,7 @@ struct matmul {
   static func profileCorrectness() {
     for i in 1...16384 {
       print("Problem size: \(i)")
-      run(M: i, N: i, K: i, blockDimensions: GEMMDimensions(M: 128, N: 64, K: 64), buildOptions: BuildOptions(executionSIMDGroups: 4, swapMN: true, splitK: 1), duplicatedCount: 1)
+      run(M: i, N: i, K: i, blockDimensions: GEMMDimensions(M: 32, N: 64, K: 64), buildOptions: BuildOptions(cooperativeExecutionSIMDGroups: 1, preemptiveExecutionSIMDGroups: 4, swapMN: true, splitK: 1), duplicatedCount: 1)
     }
   }
 
@@ -414,12 +437,12 @@ struct matmul {
       // 8. Dispatch threads
     let threadgroups: MTLSize
     if M > N {
-      threadgroups = MTLSize(width: (M + blockDimensions.M - 1) / blockDimensions.M * max(1, buildOptions.splitK), height: (N + blockDimensions.N - 1) / blockDimensions.N, depth: 1)
+      threadgroups = MTLSize(width: (M + blockDimensions.M * buildOptions.preemptiveExecutionSIMDGroups - 1) / (blockDimensions.M * buildOptions.preemptiveExecutionSIMDGroups) * max(1, buildOptions.splitK), height: (N + blockDimensions.N - 1) / blockDimensions.N, depth: 1)
     } else {
-      threadgroups = MTLSize(width: (N + blockDimensions.N - 1) / blockDimensions.N * max(1, buildOptions.splitK), height: (M + blockDimensions.M - 1) / blockDimensions.M, depth: 1)
+      threadgroups = MTLSize(width: (N + blockDimensions.N * buildOptions.preemptiveExecutionSIMDGroups - 1) / (blockDimensions.N * buildOptions.preemptiveExecutionSIMDGroups) * max(1, buildOptions.splitK), height: (M + blockDimensions.M - 1) / blockDimensions.M, depth: 1)
     }
     let simdgroupWidth = pipelineState.threadExecutionWidth
-    let threadsPerThreadgroup = MTLSize(width: simdgroupWidth * 4, height: 1, depth: 1)
+    let threadsPerThreadgroup = MTLSize(width: simdgroupWidth * max(buildOptions.preemptiveExecutionSIMDGroups, buildOptions.cooperativeExecutionSIMDGroups), height: 1, depth: 1)
 
     for _ in 0..<duplicatedCount {
       computeCommandEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
