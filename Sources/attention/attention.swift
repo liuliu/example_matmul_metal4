@@ -87,8 +87,8 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     for (unsigned short k = 0; k < \(attentionDimensions.K); k += \(blockDimensions.K)) {
       auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K) + k, tgid.x * \(blockDimensions.R));
       auto mK_0 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c);
-      matmul_qk_op.run(mQ, mK_0, cS_0);
       auto mK_1 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c + \(blockDimensions.C));
+      matmul_qk_op.run(mQ, mK_0, cS_0);
       matmul_qk_op.run(mQ, mK_1, cS_1);
     }
     // Online reduce maximum.
@@ -112,7 +112,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
       if (cS_0.is_valid_element(k)) {
-        auto it = cO_0.get_iterator(k);
+        auto it = cS_0.get_iterator(k);
         auto dst_it = cM.map_iterator(it);
         cS_0[k] = fast::exp2(cS_0[k] * (1.442695041 * 0.08838834764) - *dst_it);
         cS_1[k] = fast::exp2(cS_1[k] * (1.442695041 * 0.08838834764) - *dst_it);
