@@ -52,7 +52,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
   auto K = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(K_buf, dextents<int32_t, 2>(\(attentionDimensions.K * attentionDimensions.Hk), \(attentionDimensions.C)));
   auto V = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(V_buf, dextents<int32_t, 2>(\(attentionDimensions.K * attentionDimensions.Hk), \(attentionDimensions.C)));
   threadgroup half *P_buf = (threadgroup half*)threadgroup_block + \(blockDimensions.C) * \(blockDimensions.R) * sgid;
-  auto P = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(P_buf, dextents<int32_t, 2>(\(blockDimensions.C), \(blockDimensions.R)));
+  auto P = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(P_buf, extents<int32_t, \(blockDimensions.C), \(blockDimensions.R)>());
   constexpr auto qk_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(blockDimensions.K), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<qk_desc, execution_simdgroups<1>> matmul_qk_op;
   auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K), tgid.x * \(blockDimensions.R));
@@ -69,12 +69,11 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       cL[k] = numeric_limits<float>::denorm_min();
     }
   }
-  auto mP = P.slice<\(blockDimensions.C), \(blockDimensions.R)>(0, 0);
   auto mV = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(0, 0);
   constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), \(blockDimensions.C), false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<pv_desc, execution_simdgroups<1>> matmul_pv_op;
-  auto cO_0 = matmul_pv_op.get_destination_cooperative_tensor<decltype(mP), decltype(mV), float>();
-  auto cO_1 = matmul_pv_op.get_destination_cooperative_tensor<decltype(mP), decltype(mV), float>();
+  auto cO_0 = matmul_pv_op.get_destination_cooperative_tensor<decltype(P), decltype(mV), float>();
+  auto cO_1 = matmul_pv_op.get_destination_cooperative_tensor<decltype(P), decltype(mV), float>();
   for (uint c = 0; c < \(attentionDimensions.C); c += \(blockDimensions.C) * 2) {
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
@@ -156,11 +155,10 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    auto mP = P.slice<\(blockDimensions.C), \(blockDimensions.R)>(0, 0);
     auto mV_0_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), c);
     auto mV_0_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(blockDimensions.K), c);
-    matmul_pv_op.run(mP, mV_0_0, cO_0);
-    matmul_pv_op.run(mP, mV_0_1, cO_1);
+    matmul_pv_op.run(P, mV_0_0, cO_0);
+    matmul_pv_op.run(P, mV_0_1, cO_1);
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cS_1.get_capacity(); ++k) {
       if(cS_1.is_valid_element(k)) {
@@ -171,8 +169,8 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     simdgroup_barrier(mem_flags::mem_threadgroup);
     auto mV_1_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), c + \(blockDimensions.C));
     auto mV_1_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(blockDimensions.K), c + \(blockDimensions.C));
-    matmul_pv_op.run(mP, mV_1_0, cO_0);
-    matmul_pv_op.run(mP, mV_1_1, cO_1);
+    matmul_pv_op.run(P, mV_1_0, cO_0);
+    matmul_pv_op.run(P, mV_1_1, cO_1);
   }
   #pragma clang loop unroll(full)
   for (unsigned short k = 0; k < cO_0.get_capacity(); ++k) {
