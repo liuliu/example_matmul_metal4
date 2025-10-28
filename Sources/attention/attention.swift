@@ -92,25 +92,20 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       }
     }
     // Softmax. cS becomes cP.
-    // if (is_iterator_compatible(cS, cM)) {
-      #pragma clang loop unroll(full)
-      for (auto it = cS.begin(); it != cS.end(); ++it) {
-        auto dst_it = cM.map_iterator(it);
-        *it = fast::exp2(*it * (1.442695041 * 0.08838834764) - *dst_it);
-      }
-    // }
+    #pragma clang loop unroll(full)
+    for (auto it = cS.begin(); it != cS.end(); ++it) {
+      auto dst_it = cM.map_iterator(it);
+      *it = fast::exp2(*it * (1.442695041 * 0.08838834764) - *dst_it);
+    }
     // Online reduce sum.
     auto cL_new = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
     reduce_rows(cS, cL_new, reduction_operation::sum, (float)0);
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cL.get_capacity(); ++k) {
       if(cL.is_valid_element(k)) {
-        float correction_new = correction[k] * cL[k];
         cL[k] = cL[k] * correction[k] + cL_new[k];
-        correction[k] = correction_new;
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cS.get_capacity(); ++k) {
       if(cS.is_valid_element(k)) {
@@ -118,40 +113,32 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
         P_buf[idx[0] + idx[1] * 64] = (half)cS[k];
       }
     }
-    // if (is_iterator_compatible(cO_0, correction)) {
-      #pragma clang loop unroll(full)
-      for (auto it = cO_0.begin(); it != cO_0.end(); ++it) {
-        auto dst_it = correction.map_iterator(it);
-        *it *= *dst_it;
-      }
-    // }
-    // if (is_iterator_compatible(cO_1, correction)) {
-      #pragma clang loop unroll(full)
-      for (auto it = cO_1.begin(); it != cO_1.end(); ++it) {
-        auto dst_it = correction.map_iterator(it);
-        *it *= *dst_it;
-      }
-    // }
+    #pragma clang loop unroll(full)
+    for (auto it = cO_0.begin(); it != cO_0.end(); ++it) {
+      auto dst_it = correction.map_iterator(it);
+      *it *= *dst_it;
+    }
+    #pragma clang loop unroll(full)
+    for (auto it = cO_1.begin(); it != cO_1.end(); ++it) {
+      auto dst_it = correction.map_iterator(it);
+      *it *= *dst_it;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     auto mP = P.slice<64, 64>(0, 0);
     auto mV_0 = V.slice<64, 64>(0, c);
     auto mV_1 = V.slice<64, 64>(64, c);
     matmul_pv_op.run(mP, mV_0, cO_0);
     matmul_pv_op.run(mP, mV_1, cO_1);
-    // if (is_iterator_compatible(cO_0, cL)) {
-      #pragma clang loop unroll(full)
-      for (auto it = cO_0.begin(); it != cO_0.end(); ++it) {
-        auto dst_it = cL.map_iterator(it);
-        *it *= fast::divide(1, *dst_it);
-      }
-    // }
-    // if (is_iterator_compatible(cO_1, cL)) {
-      #pragma clang loop unroll(full)
-      for (auto it = cO_1.begin(); it != cO_1.end(); ++it) {
-        auto dst_it = cL.map_iterator(it);
-        *it *= fast::divide(1, *dst_it);
-      }
-    // }
+  }
+  #pragma clang loop unroll(full)
+  for (auto it = cO_0.begin(); it != cO_0.end(); ++it) {
+    auto dst_it = cL.map_iterator(it);
+    *it *= fast::divide(1, *dst_it);
+  }
+  #pragma clang loop unroll(full)
+  for (auto it = cO_1.begin(); it != cO_1.end(); ++it) {
+    auto dst_it = cL.map_iterator(it);
+    *it *= fast::divide(1, *dst_it);
   }
   auto mO_0 = O.slice<64, 64>(0, tgid.x * 64);
   cO_0.store(mO_0);
