@@ -57,7 +57,8 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
   matmul2d<qk_desc, execution_simdgroups<1>> matmul_qk_op;
   auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K), tgid.x * \(blockDimensions.R));
   auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), 0);
-  auto cS = matmul_qk_op.get_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
+  auto cS_0 = matmul_qk_op.get_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
+  auto cS_1 = matmul_qk_op.get_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
   auto cM = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
   auto cL = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
   auto correction = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
@@ -76,26 +77,31 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
   auto cO_1 = matmul_pv_op.get_destination_cooperative_tensor<decltype(mP), decltype(mV), float>();
   for (uint c = 0; c < \(attentionDimensions.C); c += \(blockDimensions.C) * 2) {
     #pragma clang loop unroll(full)
-    for (unsigned short k = 0; k < cS.get_capacity(); ++k) {
-      if (cS.is_valid_element(k)) {
-        cS[k] = 0;
+    for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
+      if (cS_0.is_valid_element(k)) {
+        cS_0[k] = 0;
+        cS_1[k] = 0;
       }
     }
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < \(attentionDimensions.K); k += \(blockDimensions.K)) {
       auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K) + k, tgid.x * \(blockDimensions.R));
-      auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c);
-      matmul_qk_op.run(mQ, mK, cS);
+      auto mK_0 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c);
+      matmul_qk_op.run(mQ, mK_0, cS_0);
+      auto mK_1 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c + \(blockDimensions.C));
+      matmul_qk_op.run(mQ, mK_1, cS_1);
     }
     // Online reduce maximum.
-    auto cM_new = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
-    reduce_rows(cS, cM_new, reduction_operation::max, numeric_limits<float>::lowest());
+    auto cM_0_new = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
+    reduce_rows(cS_0, cM_0_new, reduction_operation::max, numeric_limits<float>::lowest());
+    auto cM_1_new = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
+    reduce_rows(cS_1, cM_1_new, reduction_operation::max, numeric_limits<float>::lowest());
     // Online correct O
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cM.get_capacity(); ++k) {
       if (cM.is_valid_element(k)) {
         correction[k] = 1;
-        const float M_new = cM_new[k] * (1.442695041 * 0.08838834764);
+        const float M_new = max(cM_0_new[k], cM_1_new[k]) * (1.442695041 * 0.08838834764);
         if (M_new > cM[k]) {
           correction[k] = fast::exp2(cM[k] - M_new);
           cM[k] = M_new;
@@ -104,24 +110,23 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     }
     // Softmax. cS becomes cP.
     #pragma clang loop unroll(full)
-    for (auto it = cS.begin(); it != cS.end(); ++it) {
-      auto dst_it = cM.map_iterator(it);
-      *it = fast::exp2(*it * (1.442695041 * 0.08838834764) - *dst_it);
+    for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
+      if (cS_0.is_valid_element(k)) {
+        auto it = cO_0.get_iterator(k);
+        auto dst_it = cM.map_iterator(it);
+        cS_0[k] = fast::exp2(cS_0[k] * (1.442695041 * 0.08838834764) - *dst_it);
+        cS_1[k] = fast::exp2(cS_1[k] * (1.442695041 * 0.08838834764) - *dst_it);
+      }
     }
     // Online reduce sum.
-    auto cL_new = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
-    reduce_rows(cS, cL_new, reduction_operation::sum, (float)0);
+    auto cL_0_new = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
+    reduce_rows(cS_0, cL_0_new, reduction_operation::sum, (float)0);
+    auto cL_1_new = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
+    reduce_rows(cS_1, cL_1_new, reduction_operation::sum, (float)0);
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cL.get_capacity(); ++k) {
       if(cL.is_valid_element(k)) {
-        cL[k] = cL[k] * correction[k] + cL_new[k];
-      }
-    }
-    #pragma clang loop unroll(full)
-    for (unsigned short k = 0; k < cS.get_capacity(); ++k) {
-      if(cS.is_valid_element(k)) {
-        auto idx = cS.get_multidimensional_index(k);
-        P_buf[idx[0] + idx[1] * \(blockDimensions.C)] = (half)cS[k];
+        cL[k] = cL[k] * correction[k] + cL_0_new[k] + cL_1_new[k];
       }
     }
     if (c == 0) {
@@ -143,12 +148,31 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
         }
       }
     }
+    #pragma clang loop unroll(full)
+    for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
+      if(cS_0.is_valid_element(k)) {
+        auto idx = cS_0.get_multidimensional_index(k);
+        P_buf[idx[0] + idx[1] * \(blockDimensions.C)] = (half)cS_0[k];
+      }
+    }
     simdgroup_barrier(mem_flags::mem_threadgroup);
     auto mP = P.slice<\(blockDimensions.C), \(blockDimensions.R)>(0, 0);
-    auto mV_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), c);
-    auto mV_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(blockDimensions.K), c);
-    matmul_pv_op.run(mP, mV_0, cO_0);
-    matmul_pv_op.run(mP, mV_1, cO_1);
+    auto mV_0_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), c);
+    auto mV_0_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(blockDimensions.K), c);
+    matmul_pv_op.run(mP, mV_0_0, cO_0);
+    matmul_pv_op.run(mP, mV_0_1, cO_1);
+    #pragma clang loop unroll(full)
+    for (unsigned short k = 0; k < cS_1.get_capacity(); ++k) {
+      if(cS_1.is_valid_element(k)) {
+        auto idx = cS_1.get_multidimensional_index(k);
+        P_buf[idx[0] + idx[1] * \(blockDimensions.C)] = (half)cS_1[k];
+      }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    auto mV_1_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), c + \(blockDimensions.C));
+    auto mV_1_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(blockDimensions.K), c + \(blockDimensions.C));
+    matmul_pv_op.run(mP, mV_1_0, cO_0);
+    matmul_pv_op.run(mP, mV_1_1, cO_1);
   }
   #pragma clang loop unroll(full)
   for (unsigned short k = 0; k < cO_0.get_capacity(); ++k) {
