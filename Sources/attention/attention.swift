@@ -20,6 +20,7 @@ struct AttentionDimensions {
 }
 
 func createSource(blockDimensions: BlockDimenions, attentionDimensions: AttentionDimensions, buildOptions: BuildOptions) -> String {
+  let dotScale = 1.442695041 * 1 / Double(attentionDimensions.K).squareRoot()
   return """
 
 #include <metal_stdlib>
@@ -30,10 +31,13 @@ func createSource(blockDimensions: BlockDimenions, attentionDimensions: Attentio
 using namespace metal;
 using namespace mpp::tensor_ops;
 
-constant uint M [[function_constant(0)]];
-constant uint N [[function_constant(1)]];
-constant uint K [[function_constant(2)]];
+constant uint R [[function_constant(0)]];
+constant uint C [[function_constant(1)]];
+constant uint K_dim [[function_constant(2)]];
+constant uint Hq [[function_constant(3)]];
+constant uint Hk [[function_constant(4)]];
 
+constant uint C_edge = C - \(blockDimensions.C * 2) + 1;
 
 kernel void attention(device half *Q_buf [[buffer(0)]],
                       device half *K_buf [[buffer(1)]],
@@ -48,15 +52,15 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
   if (tgid.x * \(blockDimensions.R) >= \(attentionDimensions.R)) {
     return;
   }
-  auto Q = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(Q_buf, dextents<int32_t, 2>(\(attentionDimensions.K * attentionDimensions.Hq), \(attentionDimensions.R)));
-  auto K = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(K_buf, dextents<int32_t, 2>(\(attentionDimensions.K * attentionDimensions.Hk), \(attentionDimensions.C)));
-  auto V = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(V_buf, dextents<int32_t, 2>(\(attentionDimensions.K * attentionDimensions.Hk), \(attentionDimensions.C)));
+  auto Q = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(Q_buf, dextents<int32_t, 2>(K_dim * Hq, R));
+  auto K = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(K_buf, dextents<int32_t, 2>(K_dim * Hk, C));
+  auto V = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(V_buf, dextents<int32_t, 2>(K_dim * Hk, C));
   threadgroup half *P_buf = (threadgroup half*)threadgroup_block + \(blockDimensions.C) * \(blockDimensions.R) * sgid;
   auto P = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(P_buf, extents<int32_t, \(blockDimensions.C), \(blockDimensions.R)>());
   constexpr auto qk_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(blockDimensions.K), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<qk_desc, execution_simdgroups<1>> matmul_qk_op;
-  auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K), tgid.x * \(blockDimensions.R));
-  auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), 0);
+  auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * K_dim, tgid.x * \(blockDimensions.R));
+  auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim, 0);
   auto cS_0 = matmul_qk_op.get_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
   auto cS_1 = matmul_qk_op.get_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
   auto cM = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
@@ -74,7 +78,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
   matmul2d<pv_desc, execution_simdgroups<1>> matmul_pv_op;
   auto cO_0 = matmul_pv_op.get_destination_cooperative_tensor<decltype(P), decltype(mV), float>();
   // auto cO_1 = matmul_pv_op.get_destination_cooperative_tensor<decltype(P), decltype(mV), float>();
-  for (uint c = 0; c < \(attentionDimensions.C); c += \(blockDimensions.C) * 2) {
+  for (uint c = 0; c < C_edge; c += \(blockDimensions.C * 2)) {
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
       if (cS_0.is_valid_element(k)) {
@@ -83,10 +87,10 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       }
     }
     #pragma clang loop unroll(full)
-    for (unsigned short k = 0; k < \(attentionDimensions.K); k += \(blockDimensions.K)) {
-      auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K) + k, tgid.x * \(blockDimensions.R));
-      auto mK_0 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c);
-      auto mK_1 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c + \(blockDimensions.C));
+    for (unsigned short k = 0; k < K_dim; k += \(blockDimensions.K)) {
+      auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * K_dim + k, tgid.x * \(blockDimensions.R));
+      auto mK_0 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim + k, c);
+      auto mK_1 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim + k, c + \(blockDimensions.C));
       matmul_qk_op.run(mQ, mK_0, cS_0);
       matmul_qk_op.run(mQ, mK_1, cS_1);
     }
@@ -100,7 +104,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     for (unsigned short k = 0; k < cM.get_capacity(); ++k) {
       if (cM.is_valid_element(k)) {
         correction[k] = 1;
-        const float M_new = max(cM_0_new[k], cM_1_new[k]) * (1.442695041 * 0.08838834764);
+        const float M_new = max(cM_0_new[k], cM_1_new[k]) * \(dotScale);
         if (M_new > cM[k]) {
           correction[k] = fast::exp2(cM[k] - M_new);
           cM[k] = M_new;
@@ -113,8 +117,8 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       if (cS_0.is_valid_element(k)) {
         auto it = cS_0.get_iterator(k);
         auto dst_it = cM.map_iterator(it);
-        cS_0[k] = fast::exp2(cS_0[k] * (1.442695041 * 0.08838834764) - *dst_it);
-        cS_1[k] = fast::exp2(cS_1[k] * (1.442695041 * 0.08838834764) - *dst_it);
+        cS_0[k] = fast::exp2(cS_0[k] * \(dotScale) - *dst_it);
+        cS_1[k] = fast::exp2(cS_1[k] * \(dotScale) - *dst_it);
       }
     }
     // Online reduce sum.
@@ -155,8 +159,8 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    auto mV_0_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), c);
-    // auto mV_0_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(blockDimensions.K), c);
+    auto mV_0_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim, c);
+    // auto mV_0_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim + \(blockDimensions.K), c);
     matmul_pv_op.run(P, mV_0_0, cO_0);
     // matmul_pv_op.run(P, mV_0_1, cO_1);
     #pragma clang loop unroll(full)
@@ -167,28 +171,21 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    auto mV_1_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), c + \(blockDimensions.C));
-    // auto mV_1_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(blockDimensions.K), c + \(blockDimensions.C));
+    auto mV_1_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim, c + \(blockDimensions.C));
+    // auto mV_1_1 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim + \(blockDimensions.K), c + \(blockDimensions.C));
     matmul_pv_op.run(P, mV_1_0, cO_0);
     // matmul_pv_op.run(P, mV_1_1, cO_1);
   }
+  auto O = O_buf + tgid.x * (\(blockDimensions.R) * K_dim * Hq) + tgid.y * K_dim;
   #pragma clang loop unroll(full)
   for (unsigned short k = 0; k < cO_0.get_capacity(); ++k) {
     if (cO_0.is_valid_element(k)) {
       auto it = cO_0.get_iterator(k);
       auto dst_it = cL.map_iterator(it);
       auto L_reciprocal = fast::divide(1, *dst_it);
-      cO_0[k] *= L_reciprocal;
-      // cO_1[k] *= L_reciprocal;
-    }
-  }
-  auto O = O_buf + tgid.x * \(blockDimensions.R) * \(attentionDimensions.K) + tgid.y * \(attentionDimensions.K);
-  #pragma clang loop unroll(full)
-  for (unsigned short k = 0; k < cO_0.get_capacity(); ++k) {
-    if (cO_0.is_valid_element(k)) {
       auto idx = cO_0.get_multidimensional_index(k);
-      O[idx[0] + idx[1] * \(attentionDimensions.K)] = (half)cO_0[k];
-      // O[idx[0] + idx[1] * \(attentionDimensions.K) + \(blockDimensions.K)] = (half)cO_1[k];
+      O[idx[0] + idx[1] * (K_dim * Hq)] = (half)(cO_0[k] * L_reciprocal);
+      // O[idx[0] + idx[1] * (K_dim * Hq) + \(blockDimensions.K)] = (half)(cO_1[k] * L_reciprocal);
     }
   }
 }
@@ -198,7 +195,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
 @main
 struct attention {
   static func main() {
-    run(sequenceDimension: 1024, headDimension: 128, Hq: 1, Hk: 1, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 20)
+    run(sequenceDimension: 1024, headDimension: 128, Hq: 8, Hk: 8, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 20)
   }
 
   static func run(sequenceDimension: Int, headDimension: Int, Hq: Int, Hk: Int, buildOptions: BuildOptions, duplicatedCount: Int) {
@@ -227,16 +224,26 @@ struct attention {
     }
 
     let constants = MTLFunctionConstantValues()
+    var constantR: UInt32 = UInt32(sequenceDimension)
+    var constantC: UInt32 = UInt32(sequenceDimension)
+    var constantK: UInt32 = UInt32(headDimension)
+    var constantHq: UInt32 = UInt32(Hq)
+    var constantHk: UInt32 = UInt32(Hk)
+    constants.setConstantValue(&constantR, type: .uint, index: 0)
+    constants.setConstantValue(&constantC, type: .uint, index: 1)
+    constants.setConstantValue(&constantK, type: .uint, index: 2)
+    constants.setConstantValue(&constantHq, type: .uint, index: 3)
+    constants.setConstantValue(&constantHk, type: .uint, index: 4)
     // 4. Create a function object
     guard let attentionFunction = try? library.makeFunction(name: "attention", constantValues: constants) else {
       fatalError("Could not create function")
     }
 
     var networkDesc = NetworkDescriptor()
-    networkDesc.rowDimension = sequenceDimension * Hq
-    networkDesc.columnDimension = sequenceDimension * Hk
+    networkDesc.rowDimension = sequenceDimension
+    networkDesc.columnDimension = sequenceDimension
     networkDesc.headDimension = headDimension
-    let network = Network(descriptor: networkDesc)
+    let networks = (0..<Hq).map { _ in Network(descriptor: networkDesc) }
 
     // 5. Create a compute pipeline state
     let pipelineState: MTLComputePipelineState
@@ -255,9 +262,18 @@ struct attention {
     let bufferV = device.makeBuffer(length: sizeV, options: .storageModeShared)
     let bufferO = device.makeBuffer(length: sizeQ, options: .storageModeShared)
 
-    let Q: [Float16] = network.Q.map { Float16($0) }
-    let K: [Float16] = network.K.map { Float16($0) }
-    let V: [Float16] = network.V.map { Float16($0) }
+    var Q = [Float16](repeating: 0, count: sequenceDimension * headDimension * Hq)
+    var K = [Float16](repeating: 0, count: sequenceDimension * headDimension * Hk)
+    var V = [Float16](repeating: 0, count: sequenceDimension * headDimension * Hk)
+    for i in 0..<Hq {
+      for j in 0..<sequenceDimension {
+        for k in 0..<headDimension {
+          Q[j * headDimension * Hq + i * headDimension + k] = Float16(networks[i].Q[j * headDimension + k])
+          K[j * headDimension * Hq + i * headDimension + k] = Float16(networks[i].K[j * headDimension + k])
+          V[j * headDimension * Hq + i * headDimension + k] = Float16(networks[i].V[j * headDimension + k])
+        }
+      }
+    }
     bufferQ?.contents().copyMemory(from: Q, byteCount: sizeQ)
     bufferK?.contents().copyMemory(from: K, byteCount: sizeK)
     bufferV?.contents().copyMemory(from: V, byteCount: sizeV)
@@ -280,7 +296,7 @@ struct attention {
     computeCommandEncoder.setThreadgroupMemoryLength(blockDimensions.R * blockDimensions.C * buildOptions.executionSIMDGroups * MemoryLayout<Float16>.size, index: 0)
 
       // 8. Dispatch threads
-    let threadgroups = MTLSize(width: sequenceDimension / (blockDimensions.R * buildOptions.executionSIMDGroups), height: 1, depth: 1)
+    let threadgroups = MTLSize(width: sequenceDimension / (blockDimensions.R * buildOptions.executionSIMDGroups) * Hq, height: 1, depth: 1)
     let simdgroupWidth = pipelineState.threadExecutionWidth
     let threadsPerThreadgroup = MTLSize(width: simdgroupWidth * buildOptions.executionSIMDGroups, height: 1, depth: 1)
 
@@ -299,21 +315,29 @@ struct attention {
     let latency = end - start
     
     // Determine the amount of work done.
-    var operations = (2 * headDimension + 5) * sequenceDimension * sequenceDimension
+    var operations = (2 * headDimension + 5) * sequenceDimension * sequenceDimension * Hq
     operations = operations * duplicatedCount
     let gflops = Int(Double(operations) / Double(latency) / 1e9)
     print("GFlops: \(gflops)")
     // 10. Read the results
-    var resultO = [Float16](repeating: 0, count: sequenceDimension * headDimension)
-    let resultBufferPointer = bufferO?.contents().bindMemory(to: Float16.self, capacity: sequenceDimension * headDimension)
+    var resultO = [Float16](repeating: 0, count: sequenceDimension * headDimension * Hq)
+    let resultBufferPointer = bufferO?.contents().bindMemory(to: Float16.self, capacity: sequenceDimension * headDimension * Hq)
 
     if let ptr = resultBufferPointer {
-      resultO = Array(UnsafeBufferPointer(start: ptr, count: sequenceDimension * headDimension))
+      resultO = Array(UnsafeBufferPointer(start: ptr, count: sequenceDimension * headDimension * Hq))
     }
-    let expectedO = network.inferenceAttention()
+    var expectedO = [Float](repeating: 0, count: sequenceDimension * headDimension * Hq)
+    for i in 0..<Hq {
+      let O = networks[i].inferenceAttention()
+      for j in 0..<sequenceDimension {
+        for k in 0..<headDimension {
+          expectedO[j * headDimension * Hq + i * headDimension + k] = O[j * headDimension + k]
+        }
+      }
+    }
 
     // Optional: Verify the result on the CPU
-    for i in 0..<(sequenceDimension * headDimension) {
+    for i in 0..<(sequenceDimension * headDimension * Hq) {
       if abs(expectedO[i] - Float(resultO[i])) > 5e-3 {
         print("CPU calculated O[\(i)]: \(expectedO[i])")
         print("GPU calculated O[\(i)]: \(resultO[i])")
