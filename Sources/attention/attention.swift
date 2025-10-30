@@ -82,9 +82,9 @@ constant uint C [[function_constant(1)]];
 constant uint Hq [[function_constant(2)]];
 constant uint Hk [[function_constant(3)]];
 
-constant uint C_edge = C - \(blockDimensions.C * 2) + 1;
+constant uint C_edge = C >= \(blockDimensions.C * 2) ? C + 1 - \(blockDimensions.C * 2) : 0;
 constant uint C_remainder = C % \(blockDimensions.C * 2);
-constant uint R_edge = R - \(blockDimensions.R) + 1;
+constant uint R_edge = R >= \(blockDimensions.R) ? R + 1 - \(blockDimensions.R) : 0;
 constant uint R_remainder = R % \(blockDimensions.R);
 constant uint K_edge = \(attentionDimensions.K) - \(blockDimensions.K) + 1;
 constant uint K_Hq = \(attentionDimensions.K) * Hq;
@@ -110,8 +110,8 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
   auto P = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(P_buf, extents<int32_t, \(blockDimensions.C), \(blockDimensions.R)>());
   constexpr auto qk_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(blockDimensions.K), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<qk_desc, execution_simdgroups<1>> matmul_qk_op;
-  constexpr auto qk_desc_last = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(attentionDimensions.K % blockDimensions.K), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<qk_desc_last, execution_simdgroups<1>> matmul_qk_op_last;
+  constexpr auto qk_desc_remainder = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(attentionDimensions.K % blockDimensions.K), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<qk_desc_remainder, execution_simdgroups<1>> matmul_qk_op_remainder;
   auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K), tgid.x * \(blockDimensions.R));
   auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), 0);
   auto cS_0 = matmul_qk_op.get_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
@@ -150,8 +150,8 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       auto mQ = Q.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), tgid.x * \(blockDimensions.R));
       auto mK_0 = K.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), c);
       auto mK_1 = K.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), c + \(blockDimensions.C));
-      matmul_qk_op_last.run(mQ, mK_0, cS_0);
-      matmul_qk_op_last.run(mQ, mK_1, cS_1);
+      matmul_qk_op_remainder.run(mQ, mK_0, cS_0);
+      matmul_qk_op_remainder.run(mQ, mK_1, cS_1);
     }
     // Online reduce maximum.
     auto cM_0_new = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
@@ -257,10 +257,10 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     if (\(attentionDimensions.K % blockDimensions.K > 0 ? "true" : "false")) {
       auto mQ = Q.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), tgid.x * \(blockDimensions.R));
       auto mK_0 = K.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), C - C_remainder);
-      matmul_qk_op_last.run(mQ, mK_0, cS_0);
+      matmul_qk_op_remainder.run(mQ, mK_0, cS_0);
       if (C_remainder > \(blockDimensions.C)) {
         auto mK_1 = K.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), C + \(blockDimensions.C) - C_remainder);
-        matmul_qk_op_last.run(mQ, mK_1, cS_1);
+        matmul_qk_op_remainder.run(mQ, mK_1, cS_1);
       }
     }
     // Online reduce maximum.
@@ -363,7 +363,15 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
 @main
 struct attention {
   static func main() {
-    run(sequenceDimension: 520, headDimension: 120, Hq: 1, Hk: 1, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 20)
+    profileCorrectness()
+    // run(sequenceDimension: 520, headDimension: 120, Hq: 8, Hk: 8, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 20)
+  }
+  
+  static func profileCorrectness() {
+    for i in 1..<1024 {
+      print("Problem size: \(i)")
+      run(sequenceDimension: i, headDimension: 128, Hq: 2, Hk: 2, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 1)
+    }
   }
 
   static func run(sequenceDimension: Int, headDimension: Int, Hq: Int, Hk: Int, buildOptions: BuildOptions, duplicatedCount: Int) {
