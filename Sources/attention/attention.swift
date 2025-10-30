@@ -21,11 +21,57 @@ struct AttentionDimensions {
 
 func createSource(blockDimensions: BlockDimenions, attentionDimensions: AttentionDimensions, buildOptions: BuildOptions) -> String {
   let dotScale = 1.442695041 * 1 / Double(attentionDimensions.K).squareRoot()
+  let kBlocks = (attentionDimensions.K + blockDimensions.K - 1) / blockDimensions.K
+  let allocateO = ((0..<kBlocks).map {
+    "  auto cO_\($0) = matmul_pv_op.get_destination_cooperative_tensor<decltype(P), decltype(mV), float>();"
+  }).joined(separator: "\n")
+  let initializeO = ((0..<kBlocks).map {
+    "          cO_\($0)[k] = 0;"
+  }).joined(separator: "\n")
+  let correctO = ((0..<kBlocks).map {
+    "          cO_\($0)[k] *= *dst_it;"
+  }).joined(separator: "\n")
+  let accumulateO0 = ((0..<kBlocks).map {
+"""
+    auto mV_0_\($0) = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), c);
+    matmul_pv_op.run(P, mV_0_\($0), cO_\($0));
+"""
+  }).joined(separator: "\n")
+  let accumulateO1 = ((0..<kBlocks).map {
+"""
+    auto mV_1_\($0) = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), c + \(blockDimensions.C));
+    matmul_pv_op.run(P, mV_1_\($0), cO_\($0));
+"""
+  }).joined(separator: "\n")
+  let accumulateO0Last = ((0..<kBlocks).map {
+"""
+    auto mV_0_\($0) = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), C - C_remainder);
+    matmul_pv_op.run(P, mV_0_\($0), cO_\($0));
+"""
+  }).joined(separator: "\n")
+  let accumulateO1Last = ((0..<kBlocks).map {
+"""
+    auto mV_1_\($0) = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), C + \(blockDimensions.C) - C_remainder);
+    matmul_pv_op.run(P, mV_1_\($0), cO_\($0));
+"""
+  }).joined(separator: "\n")
+  let writeO = ((0..<kBlocks).map {
+    if ($0 < kBlocks - 1) || (attentionDimensions.K % blockDimensions.K == 0) {
+      return """
+        O[idx[0] + \($0 * blockDimensions.K) + idx[1] * K_Hq] = (half)(cO_\($0)[k] * L_reciprocal);
+"""
+    } else {
+      return """
+        if (idx[0] + \($0 * blockDimensions.K) < \(attentionDimensions.K)) {
+          O[idx[0] + \($0 * blockDimensions.K) + idx[1] * K_Hq] = (half)(cO_\($0)[k] * L_reciprocal);
+        }
+"""
+    }
+  }).joined(separator: "\n")
   return """
 
 #include <metal_stdlib>
 #include <metal_tensor>
-// Doesn't seem this header is provided at runtime, hence JIT shader won't work unless we package all the headers too.
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 
 using namespace metal;
@@ -33,16 +79,16 @@ using namespace mpp::tensor_ops;
 
 constant uint R [[function_constant(0)]];
 constant uint C [[function_constant(1)]];
-constant uint K_dim [[function_constant(2)]];
-constant uint Hq [[function_constant(3)]];
-constant uint Hk [[function_constant(4)]];
+constant uint Hq [[function_constant(2)]];
+constant uint Hk [[function_constant(3)]];
 
 constant uint C_edge = C - \(blockDimensions.C * 2) + 1;
 constant uint C_remainder = C % \(blockDimensions.C * 2);
 constant uint R_edge = R - \(blockDimensions.R) + 1;
 constant uint R_remainder = R % \(blockDimensions.R);
-constant uint K_Hq = K_dim * Hq;
-constant uint K_Hk = K_dim * Hk;
+constant uint K_edge = \(attentionDimensions.K) - \(blockDimensions.K) + 1;
+constant uint K_Hq = \(attentionDimensions.K) * Hq;
+constant uint K_Hk = \(attentionDimensions.K) * Hk;
 
 kernel void attention(device half *Q_buf [[buffer(0)]],
                       device half *K_buf [[buffer(1)]],
@@ -64,8 +110,10 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
   auto P = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(P_buf, extents<int32_t, \(blockDimensions.C), \(blockDimensions.R)>());
   constexpr auto qk_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(blockDimensions.K), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<qk_desc, execution_simdgroups<1>> matmul_qk_op;
-  auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * K_dim, tgid.x * \(blockDimensions.R));
-  auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim, 0);
+  constexpr auto qk_desc_last = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(attentionDimensions.K % blockDimensions.K), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<qk_desc_last, execution_simdgroups<1>> matmul_qk_op_last;
+  auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K), tgid.x * \(blockDimensions.R));
+  auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), 0);
   auto cS_0 = matmul_qk_op.get_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
   auto cS_1 = matmul_qk_op.get_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
   auto cM = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
@@ -81,7 +129,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
   auto mV = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(0, 0);
   constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), \(blockDimensions.C), false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<pv_desc, execution_simdgroups<1>> matmul_pv_op;
-  auto cO_0 = matmul_pv_op.get_destination_cooperative_tensor<decltype(P), decltype(mV), float>();
+\(allocateO)
   for (uint c = 0; c < C_edge; c += \(blockDimensions.C * 2)) {
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
@@ -91,12 +139,19 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       }
     }
     #pragma clang loop unroll(full)
-    for (unsigned short k = 0; k < K_dim; k += \(blockDimensions.K)) {
-      auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * K_dim + k, tgid.x * \(blockDimensions.R));
-      auto mK_0 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim + k, c);
-      auto mK_1 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim + k, c + \(blockDimensions.C));
+    for (unsigned short k = 0; k < K_edge; k += \(blockDimensions.K)) {
+      auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K) + k, tgid.x * \(blockDimensions.R));
+      auto mK_0 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c);
+      auto mK_1 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c + \(blockDimensions.C));
       matmul_qk_op.run(mQ, mK_0, cS_0);
       matmul_qk_op.run(mQ, mK_1, cS_1);
+    }
+    if (\(attentionDimensions.K % blockDimensions.K > 0 ? "true" : "false")) {
+      auto mQ = Q.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), tgid.x * \(blockDimensions.R));
+      auto mK_0 = K.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), c);
+      auto mK_1 = K.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), c + \(blockDimensions.C));
+      matmul_qk_op_last.run(mQ, mK_0, cS_0);
+      matmul_qk_op_last.run(mQ, mK_1, cS_1);
     }
     // Online reduce maximum.
     auto cM_0_new = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
@@ -140,7 +195,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       #pragma clang loop unroll(full)
       for (unsigned short k = 0; k < cO_0.get_capacity(); ++k) {
         if (cO_0.is_valid_element(k)) {
-          cO_0[k] = 0;
+\(initializeO)
         }
       }
     } else {
@@ -149,7 +204,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
         if (cO_0.is_valid_element(k)) {
           auto it = cO_0.get_iterator(k);
           auto dst_it = correction.map_iterator(it);
-          cO_0[k] *= *dst_it;
+\(correctO)
         }
       }
     }
@@ -161,8 +216,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    auto mV_0_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim, c);
-    matmul_pv_op.run(P, mV_0_0, cO_0);
+\(accumulateO0)
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cS_1.get_capacity(); ++k) {
       if(cS_1.is_valid_element(k)) {
@@ -171,8 +225,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    auto mV_1_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim, c + \(blockDimensions.C));
-    matmul_pv_op.run(P, mV_1_0, cO_0);
+\(accumulateO1)
   }
   if (C_remainder > 0) {
     #pragma clang loop unroll(full)
@@ -192,13 +245,22 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       }
     }
     #pragma clang loop unroll(full)
-    for (unsigned short k = 0; k < K_dim; k += \(blockDimensions.K)) {
-      auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * K_dim + k, tgid.x * \(blockDimensions.R));
-      auto mK_0 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim + k, C - C_remainder);
+    for (unsigned short k = 0; k < K_edge; k += \(blockDimensions.K)) {
+      auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K) + k, tgid.x * \(blockDimensions.R));
+      auto mK_0 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, C - C_remainder);
       matmul_qk_op.run(mQ, mK_0, cS_0);
       if (C_remainder > \(blockDimensions.C)) {
-        auto mK_1 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim + k, C + \(blockDimensions.C) - C_remainder);
+        auto mK_1 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, C + \(blockDimensions.C) - C_remainder);
         matmul_qk_op.run(mQ, mK_1, cS_1);
+      }
+    }
+    if (\(attentionDimensions.K % blockDimensions.K > 0 ? "true" : "false")) {
+      auto mQ = Q.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), tgid.x * \(blockDimensions.R));
+      auto mK_0 = K.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), C - C_remainder);
+      matmul_qk_op_last.run(mQ, mK_0, cS_0);
+      if (C_remainder > \(blockDimensions.C)) {
+        auto mK_1 = K.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), C + \(blockDimensions.C) - C_remainder);
+        matmul_qk_op_last.run(mQ, mK_1, cS_1);
       }
     }
     // Online reduce maximum.
@@ -244,7 +306,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       if (cO_0.is_valid_element(k)) {
         auto it = cO_0.get_iterator(k);
         auto dst_it = correction.map_iterator(it);
-        cO_0[k] *= *dst_it;
+\(correctO)
       }
     }
     #pragma clang loop unroll(full)
@@ -255,8 +317,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    auto mV_0_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim, C - C_remainder);
-    matmul_pv_op.run(P, mV_0_0, cO_0);
+\(accumulateO0Last)
     if (C_remainder > \(blockDimensions.C)) {
       #pragma clang loop unroll(full)
       for (unsigned short k = 0; k < cS_1.get_capacity(); ++k) {
@@ -266,11 +327,10 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
         }
       }
       simdgroup_barrier(mem_flags::mem_threadgroup);
-      auto mV_1_0 = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * K_dim, C + \(blockDimensions.C) - C_remainder);
-      matmul_pv_op.run(P, mV_1_0, cO_0);
+\(accumulateO1Last)
     }
   }
-  auto O = O_buf + tgid.x * (\(blockDimensions.R) * K_Hq) + tgid.y * K_dim;
+  auto O = O_buf + tgid.x * (\(blockDimensions.R) * K_Hq) + tgid.y * \(attentionDimensions.K);
   if (R_remainder > 0 && tgid.x * \(blockDimensions.R) >= R_edge) {
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cO_0.get_capacity(); ++k) {
@@ -280,7 +340,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
         auto L_reciprocal = fast::divide(1, *dst_it);
         auto idx = cO_0.get_multidimensional_index(k);
         if (idx[1] < (int)R_remainder) {
-          O[idx[0] + idx[1] * (K_Hq)] = (half)(cO_0[k] * L_reciprocal);
+\(writeO)
         }
       }
     }
@@ -292,7 +352,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
         auto dst_it = cL.map_iterator(it);
         auto L_reciprocal = fast::divide(1, *dst_it);
         auto idx = cO_0.get_multidimensional_index(k);
-        O[idx[0] + idx[1] * (K_Hq)] = (half)(cO_0[k] * L_reciprocal);
+\(writeO)
       }
     }
   }
@@ -303,7 +363,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
 @main
 struct attention {
   static func main() {
-    run(sequenceDimension: 590, headDimension: 128, Hq: 8, Hk: 8, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 20)
+    run(sequenceDimension: 520, headDimension: 120, Hq: 1, Hk: 1, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 20)
   }
 
   static func run(sequenceDimension: Int, headDimension: Int, Hq: Int, Hk: Int, buildOptions: BuildOptions, duplicatedCount: Int) {
@@ -322,7 +382,7 @@ struct attention {
       fatalError("Could not create command queue")
     }
 
-    let blockDimensions = BlockDimenions(R: 16, C: 64, K: 128)
+    let blockDimensions = BlockDimenions(R: 16, C: 64, K: 64)
     let library: MTLLibrary
     do {
       let source = createSource(blockDimensions: blockDimensions, attentionDimensions: AttentionDimensions(R: sequenceDimension, C: sequenceDimension, K: headDimension, Hq: Hq, Hk: Hk), buildOptions: buildOptions)
@@ -334,14 +394,12 @@ struct attention {
     let constants = MTLFunctionConstantValues()
     var constantR: UInt32 = UInt32(sequenceDimension)
     var constantC: UInt32 = UInt32(sequenceDimension)
-    var constantK: UInt32 = UInt32(headDimension)
     var constantHq: UInt32 = UInt32(Hq)
     var constantHk: UInt32 = UInt32(Hk)
     constants.setConstantValue(&constantR, type: .uint, index: 0)
     constants.setConstantValue(&constantC, type: .uint, index: 1)
-    constants.setConstantValue(&constantK, type: .uint, index: 2)
-    constants.setConstantValue(&constantHq, type: .uint, index: 3)
-    constants.setConstantValue(&constantHk, type: .uint, index: 4)
+    constants.setConstantValue(&constantHq, type: .uint, index: 2)
+    constants.setConstantValue(&constantHk, type: .uint, index: 3)
     // 4. Create a function object
     guard let attentionFunction = try? library.makeFunction(name: "attention", constantValues: constants) else {
       fatalError("Could not create function")
