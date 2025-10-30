@@ -43,13 +43,13 @@ func createSource(blockDimensions: BlockDimenions, attentionDimensions: Attentio
     matmul_pv_op.run(P, mV_1_\($0), cO_\($0));
 """
   }).joined(separator: "\n")
-  let accumulateO0Last = ((0..<kBlocks).map {
+  let accumulateO0Remainder = ((0..<kBlocks).map {
 """
     auto mV_0_\($0) = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), C - C_remainder);
     matmul_pv_op.run(P, mV_0_\($0), cO_\($0));
 """
   }).joined(separator: "\n")
-  let accumulateO1Last = ((0..<kBlocks).map {
+  let accumulateO1Remainder = ((0..<kBlocks).map {
 """
     auto mV_1_\($0) = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), C + \(blockDimensions.C) - C_remainder);
     matmul_pv_op.run(P, mV_1_\($0), cO_\($0));
@@ -317,7 +317,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
-\(accumulateO0Last)
+\(accumulateO0Remainder)
     if (C_remainder > \(blockDimensions.C)) {
       #pragma clang loop unroll(full)
       for (unsigned short k = 0; k < cS_1.get_capacity(); ++k) {
@@ -327,7 +327,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
         }
       }
       simdgroup_barrier(mem_flags::mem_threadgroup);
-\(accumulateO1Last)
+\(accumulateO1Remainder)
     }
   }
   auto O = O_buf + tgid.x * (\(blockDimensions.R) * K_Hq) + tgid.y * \(attentionDimensions.K);
