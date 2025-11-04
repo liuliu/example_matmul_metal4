@@ -43,16 +43,22 @@ func createSource(blockDimensions: BlockDimenions, attentionDimensions: Attentio
     matmul_pv_op.run(P, mV_1_\($0), cO_\($0));
 """
   }).joined(separator: "\n")
-  let accumulateO0Remainder = ((0..<kBlocks).map {
+  let accumulateO0RemainderOrdinary = ((0..<kBlocks).map {
 """
     auto mV_0_\($0) = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), C - C_remainder);
     matmul_pv_op.run(P, mV_0_\($0), cO_\($0));
 """
   }).joined(separator: "\n")
+    let accumulateO0Remainder = ((0..<kBlocks).map {
+  """
+      auto mV_0_\($0) = V.slice<\(blockDimensions.K), dynamic_extent>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), C - C_remainder);
+      matmul_pv_op.run(mP, mV_0_\($0), cO_\($0));
+  """
+  }).joined(separator: "\n")
   let accumulateO1Remainder = ((0..<kBlocks).map {
 """
-    auto mV_1_\($0) = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), C + \(blockDimensions.C) - C_remainder);
-    matmul_pv_op.run(P, mV_1_\($0), cO_\($0));
+    auto mV_1_\($0) = V.slice<\(blockDimensions.K), dynamic_extent>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), C + \(blockDimensions.C) - C_remainder);
+    matmul_pv_op.run(mP, mV_1_\($0), cO_\($0));
 """
   }).joined(separator: "\n")
   let writeO = ((0..<kBlocks).map {
@@ -286,8 +292,17 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       if (cS_0.is_valid_element(k)) {
         auto it = cS_0.get_iterator(k);
         auto dst_it = cM.map_iterator(it);
-        cS_0[k] = fast::exp2(cS_0[k] * \(dotScale) - *dst_it);
-        cS_1[k] = fast::exp2(cS_1[k] * \(dotScale) - *dst_it);
+        auto idx = cS_0.get_multidimensional_index(k);
+        if (idx[0] >= (int)C_remainder) {
+          cS_0[k] = 0;
+        } else {
+          cS_0[k] = fast::exp2(cS_0[k] * \(dotScale) - *dst_it);
+        }
+        if (idx[0] + \(blockDimensions.C) >= (int)C_remainder) {
+          cS_1[k] = 0;
+        } else {
+          cS_1[k] = fast::exp2(cS_1[k] * \(dotScale) - *dst_it);
+        }
       }
     }
     // Online reduce sum.
@@ -309,25 +324,55 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
 \(correctO)
       }
     }
-    #pragma clang loop unroll(full)
-    for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
-      if(cS_0.is_valid_element(k)) {
-        auto idx = cS_0.get_multidimensional_index(k);
-        P_buf[idx[0] + idx[1] * \(blockDimensions.C)] = (half)cS_0[k];
-      }
-    }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-\(accumulateO0Remainder)
-    if (C_remainder > \(blockDimensions.C)) {
+    if (C_remainder < \(blockDimensions.C)) {
       #pragma clang loop unroll(full)
-      for (unsigned short k = 0; k < cS_1.get_capacity(); ++k) {
-        if(cS_1.is_valid_element(k)) {
-          auto idx = cS_1.get_multidimensional_index(k);
-          P_buf[idx[0] + idx[1] * \(blockDimensions.C)] = (half)cS_1[k];
+      for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
+        if(cS_0.is_valid_element(k)) {
+          auto idx = cS_0.get_multidimensional_index(k);
+          if (idx[0] >= (int)C_remainder) {
+            P_buf[idx[0] - C_remainder + idx[1] * \(blockDimensions.C)] = 0;
+          } else {
+            P_buf[\(blockDimensions.C) - C_remainder + idx[0] + idx[1] * \(blockDimensions.C)] = (half)cS_0[k];
+          }
         }
       }
       simdgroup_barrier(mem_flags::mem_threadgroup);
+      // The reason to do this is because when K (in GEMM sense) is smaller (in this case, C_remainder is smaller than blockDimensions.C),
+      // we need to start a new matmul descriptor with dynamic_extent for that, hence we copied the P_buf in this way and then sliced it.
+      auto mP = P.slice<dynamic_extent, \(blockDimensions.R)>(\(blockDimensions.C) - C_remainder, 0);
+      constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), dynamic_length_v<int>, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+      matmul2d<pv_desc, execution_simdgroups<1>> matmul_pv_op;
+\(accumulateO0Remainder)
+    } else {
+      #pragma clang loop unroll(full)
+      for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
+        if(cS_0.is_valid_element(k)) {
+          auto idx = cS_0.get_multidimensional_index(k);
+          P_buf[idx[0] + idx[1] * \(blockDimensions.C)] = (half)cS_0[k];
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+\(accumulateO0RemainderOrdinary)
+      if (C_remainder > \(blockDimensions.C)) {
+        #pragma clang loop unroll(full)
+        for (unsigned short k = 0; k < cS_1.get_capacity(); ++k) {
+          if(cS_1.is_valid_element(k)) {
+            auto idx = cS_1.get_multidimensional_index(k);
+            if (idx[0] + \(blockDimensions.C) >= (int)C_remainder) {
+              P_buf[idx[0] - (C_remainder - \(blockDimensions.C)) + idx[1] * \(blockDimensions.C)] = 0;
+            } else {
+              P_buf[\(blockDimensions.C * 2) - C_remainder + idx[0] + idx[1] * \(blockDimensions.C)] = (half)cS_1[k];
+            }
+          }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        // The reason to do this is because when K (in GEMM sense) is smaller (in this case, C_remainder is smaller than blockDimensions.C),
+        // we need to start a new matmul descriptor with dynamic_extent for that, hence we copied the P_buf in this way and then sliced it.
+        auto mP = P.slice<dynamic_extent, \(blockDimensions.R)>(\(blockDimensions.C * 2) - C_remainder, 0);
+        constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), dynamic_length_v<int>, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+        matmul2d<pv_desc, execution_simdgroups<1>> matmul_pv_op;
 \(accumulateO1Remainder)
+      }
     }
   }
   auto O = O_buf + tgid.x * (\(blockDimensions.R) * K_Hq) + tgid.y * \(attentionDimensions.K);
@@ -363,14 +408,14 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
 @main
 struct attention {
   static func main() {
-    profileCorrectness()
-    // run(sequenceDimension: 520, headDimension: 120, Hq: 8, Hk: 8, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 20)
+    // profileCorrectness()
+    run(sequenceDimension: 194, headDimension: 128, Hq: 1, Hk: 1, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 1)
   }
   
   static func profileCorrectness() {
     for i in 1..<1024 {
       print("Problem size: \(i)")
-      run(sequenceDimension: i, headDimension: 128, Hq: 2, Hk: 2, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 1)
+      run(sequenceDimension: i, headDimension: 128, Hq: 8, Hk: 8, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 1)
     }
   }
 
@@ -390,7 +435,7 @@ struct attention {
       fatalError("Could not create command queue")
     }
 
-    let blockDimensions = BlockDimenions(R: 16, C: 64, K: 64)
+    let blockDimensions = BlockDimenions(R: 16, C: 64, K: 128)
     let library: MTLLibrary
     do {
       let source = createSource(blockDimensions: blockDimensions, attentionDimensions: AttentionDimensions(R: sequenceDimension, C: sequenceDimension, K: headDimension, Hq: Hq, Hk: Hk), buildOptions: buildOptions)
