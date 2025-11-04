@@ -76,9 +76,10 @@ constant uint C [[function_constant(1)]];
 constant uint Hq [[function_constant(2)]];
 constant uint Hk [[function_constant(3)]];
 
-constant uint C_edge = C >= \(blockDimensions.C) ? C + 1 - \(blockDimensions.C) : 0;
 constant uint C_edge_1 = C >= \(blockDimensions.C * 2) ? C + 1 - \(blockDimensions.C * 2) : 0;
-constant uint C_remainder = C % \(blockDimensions.C);
+// In this special case, leaving the rest to the trailing block to process.
+constant uint C_edge = (C % \(blockDimensions.C * 2)) == \(blockDimensions.C) ? C_edge_1 : (C >= \(blockDimensions.C) ? C + 1 - \(blockDimensions.C) : 0);
+constant uint C_remainder = (C % \(blockDimensions.C * 2)) == \(blockDimensions.C) ? \(blockDimensions.C) : (C % \(blockDimensions.C));
 constant uint C_remainder_1 = C % \(blockDimensions.C * 2);
 constant uint R_edge = R >= \(blockDimensions.R) ? R + 1 - \(blockDimensions.R) : 0;
 constant uint R_remainder = R % \(blockDimensions.R);
@@ -148,19 +149,15 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K) + k, tgid.x * \(blockDimensions.R));
       auto mK_0 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c);
       matmul_qk_op.run(mQ, mK_0, cS_0);
-      if (c < C - \(blockDimensions.C)) {
-        auto mK_1 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c + \(blockDimensions.C));
-        matmul_qk_op.run(mQ, mK_1, cS_1);
-      }
+      auto mK_1 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c + \(blockDimensions.C));
+      matmul_qk_op.run(mQ, mK_1, cS_1);
     }
     if (\(attentionDimensions.K % blockDimensions.K > 0 ? "true" : "false")) {
       auto mQ = Q.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), tgid.x * \(blockDimensions.R));
       auto mK_0 = K.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), c);
       matmul_qk_op_remainder.run(mQ, mK_0, cS_0);
-      if (c < C - \(blockDimensions.C)) {
-        auto mK_1 = K.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), c + \(blockDimensions.C));
-        matmul_qk_op_remainder.run(mQ, mK_1, cS_1);
-      }
+      auto mK_1 = K.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), c + \(blockDimensions.C));
+      matmul_qk_op_remainder.run(mQ, mK_1, cS_1);
     }
     // Online reduce maximum.
     auto cM_0_new = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
@@ -245,7 +242,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       }
       simdgroup_barrier(mem_flags::mem_threadgroup);
 \(accumulateO1)
-    } else if (C_remainder > 0) {
+    } else {
       #pragma clang loop unroll(full)
       for (unsigned short k = 0; k < cS_1.get_capacity(); ++k) {
         if(cS_1.is_valid_element(k)) {
@@ -266,7 +263,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
 \(accumulateO0Remainder)
     }
   }
-  if (C_remainder > 0 && C_remainder_1 < \(blockDimensions.C)) {
+  if (C_remainder > 0 && C_remainder_1 <= \(blockDimensions.C)) {
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
       if (cS_0.is_valid_element(k)) {
