@@ -79,6 +79,7 @@ constant uint Hk [[function_constant(3)]];
 constant uint C_edge = C >= \(blockDimensions.C) ? C + 1 - \(blockDimensions.C) : 0;
 constant uint C_edge_1 = C >= \(blockDimensions.C * 2) ? C + 1 - \(blockDimensions.C * 2) : 0;
 constant uint C_remainder = C % \(blockDimensions.C);
+constant uint C_remainder_1 = C % \(blockDimensions.C * 2);
 constant uint R_edge = R >= \(blockDimensions.R) ? R + 1 - \(blockDimensions.R) : 0;
 constant uint R_remainder = R % \(blockDimensions.R);
 constant uint K_edge = \(attentionDimensions.K) - \(blockDimensions.K) + 1;
@@ -130,7 +131,16 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
       if (cS_0.is_valid_element(k)) {
         cS_0[k] = 0;
-        cS_1[k] = c < C_edge_1 ? 0 : numeric_limits<float>::lowest();
+        if (c < C_edge_1) {
+          cS_1[k] = 0;
+        } else {
+          auto idx = cS_1.get_multidimensional_index(k);
+          if (idx[0] >= (int)C_remainder) {
+            cS_1[k] = numeric_limits<float>::lowest();
+          } else {
+            cS_1[k] = 0;
+          }
+        }
       }
     }
     #pragma clang loop unroll(full)
@@ -138,7 +148,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K) + k, tgid.x * \(blockDimensions.R));
       auto mK_0 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c);
       matmul_qk_op.run(mQ, mK_0, cS_0);
-      if (c < C_edge_1) {
+      if (c < C - \(blockDimensions.C)) {
         auto mK_1 = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + k, c + \(blockDimensions.C));
         matmul_qk_op.run(mQ, mK_1, cS_1);
       }
@@ -147,7 +157,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       auto mQ = Q.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), tgid.x * \(blockDimensions.R));
       auto mK_0 = K.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), c);
       matmul_qk_op_remainder.run(mQ, mK_0, cS_0);
-      if (c < C_edge_1) {
+      if (c < C - \(blockDimensions.C)) {
         auto mK_1 = K.slice<\(attentionDimensions.K % blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \(attentionDimensions.K - (attentionDimensions.K % blockDimensions.K)), c + \(blockDimensions.C));
         matmul_qk_op_remainder.run(mQ, mK_1, cS_1);
       }
@@ -176,7 +186,16 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
         auto it = cS_0.get_iterator(k);
         auto dst_it = cM.map_iterator(it);
         cS_0[k] = fast::exp2(cS_0[k] * \(dotScale) - *dst_it);
-        cS_1[k] = c < C_edge_1 ? fast::exp2(cS_1[k] * \(dotScale) - *dst_it) : 0;
+        if (c < C_edge_1) {
+          cS_1[k] = fast::exp2(cS_1[k] * \(dotScale) - *dst_it);
+        } else {
+          auto idx = cS_1.get_multidimensional_index(k);
+          if (idx[0] >= (int)C_remainder) {
+            cS_1[k] = 0;
+          } else {
+            cS_1[k] = fast::exp2(cS_1[k] * \(dotScale) - *dst_it);
+          }
+        }
       }
     }
     // Online reduce sum.
@@ -226,9 +245,28 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       }
       simdgroup_barrier(mem_flags::mem_threadgroup);
 \(accumulateO1)
+    } else if (C_remainder > 0) {
+      #pragma clang loop unroll(full)
+      for (unsigned short k = 0; k < cS_1.get_capacity(); ++k) {
+        if(cS_1.is_valid_element(k)) {
+          auto idx = cS_1.get_multidimensional_index(k);
+          if (idx[0] >= (int)C_remainder) {
+            P_buf[idx[0] - C_remainder + idx[1] * \(blockDimensions.C)] = 0;
+          } else {
+            P_buf[\(blockDimensions.C) - C_remainder + idx[0] + idx[1] * \(blockDimensions.C)] = (half)cS_1[k];
+          }
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      // The reason to do this is because when K (in GEMM sense) is smaller (in this case, C_remainder is smaller than blockDimensions.C),
+      // we need to start a new matmul descriptor with dynamic_extent for that, hence we copied the P_buf in this way and then sliced it.
+      auto mP = P.slice<dynamic_extent, \(blockDimensions.R)>(\(blockDimensions.C) - C_remainder, 0);
+      constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), dynamic_length_v<int>, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+      matmul2d<pv_desc, execution_simdgroups<1>> matmul_pv_op;
+\(accumulateO0Remainder)
     }
   }
-  if (C_remainder > 0) {
+  if (C_remainder > 0 && C_remainder_1 < \(blockDimensions.C)) {
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
       if (cS_0.is_valid_element(k)) {
