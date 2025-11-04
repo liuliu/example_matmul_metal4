@@ -380,11 +380,11 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cO_0.get_capacity(); ++k) {
       if (cO_0.is_valid_element(k)) {
-        auto it = cO_0.get_iterator(k);
-        auto dst_it = cL.map_iterator(it);
-        auto L_reciprocal = fast::divide(1, *dst_it);
         auto idx = cO_0.get_multidimensional_index(k);
         if (idx[1] < (int)R_remainder) {
+          auto it = cO_0.get_iterator(k);
+          auto dst_it = cL.map_iterator(it);
+          auto L_reciprocal = fast::divide(1, *dst_it);
 \(writeO)
         }
       }
@@ -409,7 +409,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
 struct attention {
   static func main() {
     // profileCorrectness()
-    run(sequenceDimension: 194, headDimension: 128, Hq: 1, Hk: 1, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 1)
+    run(sequenceDimension: 4162, headDimension: 128, Hq: 1, Hk: 1, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 1)
   }
   
   static func profileCorrectness() {
