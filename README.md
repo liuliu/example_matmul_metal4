@@ -44,3 +44,10 @@ bash package.sh
 ## Benchmark
 
 TBD.
+
+## Bugs
+
+### 2015.11.05
+
+When specifying inner-product dimension (a.k.a. K in M / N / K) for `matmul2d_descriptor`, 26.1 now requires it to be a multiple of 32 otherwise it will cut to multiple of 32, resulting incorrect result. `dynamic_length_v<int>` will fix this issue, with minimal performance impact.
+

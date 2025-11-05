@@ -62,6 +62,18 @@ func createSource(blockDimensions: BlockDimenions, attentionDimensions: Attentio
 """
     }
   }).joined(separator: "\n")
+  let pvInnerDim: String
+  if blockDimensions.C % 32 == 0 {
+    pvInnerDim = "\(blockDimensions.C)"
+  } else {
+    pvInnerDim = "dynamic_length_v<int>"
+  }
+  let qkInnerDim: String
+  if blockDimensions.K % 32 == 0 {
+    qkInnerDim = "\(blockDimensions.K)"
+  } else {
+    qkInnerDim = "dynamic_length_v<int>"
+  }
   return """
 
 #include <metal_stdlib>
@@ -105,9 +117,9 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
   auto V = tensor<device half,  dextents<int32_t, 2>, tensor_inline>(V_buf, dextents<int32_t, 2>(K_Hk, C));
   threadgroup half *P_buf = (threadgroup half*)threadgroup_block + \(blockDimensions.C) * \(blockDimensions.R) * sgid;
   auto P = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(P_buf, extents<int32_t, \(blockDimensions.C), \(blockDimensions.R)>());
-  constexpr auto qk_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(blockDimensions.K), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto qk_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(qkInnerDim), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<qk_desc, execution_simdgroups<1>> matmul_qk_op;
-  constexpr auto qk_desc_remainder = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), \(attentionDimensions.K % blockDimensions.K), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto qk_desc_remainder = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.C), dynamic_length_v<int>, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<qk_desc_remainder, execution_simdgroups<1>> matmul_qk_op_remainder;
   auto mQ = Q.slice<\(blockDimensions.K), \(blockDimensions.R)>(tgid.y * \(attentionDimensions.K), tgid.x * \(blockDimensions.R));
   auto mK = K.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K), 0);
@@ -124,7 +136,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     }
   }
   auto mV = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(0, 0);
-  constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), dynamic_length_v<int>, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), \(pvInnerDim), false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<pv_desc, execution_simdgroups<1>> matmul_pv_op;
 \(allocateO)
   for (uint c = 0; c < C_edge; c += \(blockDimensions.C * 2)) {
