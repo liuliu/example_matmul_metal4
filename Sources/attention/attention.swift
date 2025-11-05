@@ -124,7 +124,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     }
   }
   auto mV = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(0, 0);
-  constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), \(blockDimensions.C), false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), dynamic_length_v<int>, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<pv_desc, execution_simdgroups<1>> matmul_pv_op;
 \(allocateO)
   for (uint c = 0; c < C_edge; c += \(blockDimensions.C * 2)) {
@@ -411,7 +411,7 @@ struct attention {
       fatalError("Could not create command queue")
     }
 
-    let blockDimensions = BlockDimenions(R: 16, C: 64, K: 128)
+    let blockDimensions = BlockDimenions(R: 16, C: 48, K: 128)
     let library: MTLLibrary
     do {
       let source = createSource(blockDimensions: blockDimensions, attentionDimensions: AttentionDimensions(R: sequenceDimension, C: sequenceDimension, K: headDimension, Hq: Hq, Hk: Hk), buildOptions: buildOptions)
