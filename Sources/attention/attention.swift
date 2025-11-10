@@ -131,7 +131,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
   #pragma clang loop unroll(full)
   for (unsigned short k = 0; k < cM.get_capacity(); ++k) {
     if (cM.is_valid_element(k)) {
-      cM[k] = numeric_limits<float>::lowest();
+      cM[k] = -numeric_limits<float>::infinity();
       cL[k] = numeric_limits<float>::denorm_min();
     }
   }
@@ -149,7 +149,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
         } else {
           auto idx = cS_1.get_multidimensional_index(k);
           if (idx[0] >= (int)C_remainder) {
-            cS_1[k] = numeric_limits<float>::lowest();
+            cS_1[k] = -numeric_limits<float>::infinity();
           } else {
             cS_1[k] = 0;
           }
@@ -173,9 +173,9 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     }
     // Online reduce maximum.
     auto cM_0_new = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
-    reduce_rows(cS_0, cM_0_new, reduction_operation::max, numeric_limits<float>::lowest());
+    reduce_rows(cS_0, cM_0_new, reduction_operation::max, -numeric_limits<float>::infinity());
     auto cM_1_new = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
-    reduce_rows(cS_1, cM_1_new, reduction_operation::max, numeric_limits<float>::lowest());
+    reduce_rows(cS_1, cM_1_new, reduction_operation::max, -numeric_limits<float>::infinity());
     // Online correct O
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cM.get_capacity(); ++k) {
@@ -281,7 +281,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
       if (cS_0.is_valid_element(k)) {
         auto idx = cS_0.get_multidimensional_index(k);
         if (idx[0] >= (int)C_remainder) {
-          cS_0[k] = numeric_limits<float>::lowest();
+          cS_0[k] = -numeric_limits<float>::infinity();
         } else {
           cS_0[k] = 0;
         }
@@ -300,7 +300,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
     }
     // Online reduce maximum.
     auto cM_0_new = matmul_qk_op.get_row_reduction_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
-    reduce_rows(cS_0, cM_0_new, reduction_operation::max, numeric_limits<float>::lowest());
+    reduce_rows(cS_0, cM_0_new, reduction_operation::max, -numeric_limits<float>::infinity());
     // Online correct O
     #pragma clang loop unroll(full)
     for (unsigned short k = 0; k < cM.get_capacity(); ++k) {
