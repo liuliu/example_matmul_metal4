@@ -3,6 +3,7 @@ import Foundation
 
 struct BuildOptions {
   var executionSIMDGroups: Int
+  var bypassThreadgroupMemory: Bool
 }
 
 struct BlockDimenions {
@@ -22,8 +23,15 @@ struct AttentionDimensions {
 func createSource(blockDimensions: BlockDimenions, attentionDimensions: AttentionDimensions, buildOptions: BuildOptions) -> String {
   let dotScale = 1.442695041 * 1 / Double(attentionDimensions.K).squareRoot()
   let kBlocks = (attentionDimensions.K + blockDimensions.K - 1) / blockDimensions.K
+  let preferredP = buildOptions.bypassThreadgroupMemory ? "cP" : "P"
+  let allocateP: String
+  if buildOptions.bypassThreadgroupMemory {
+    allocateP = "    auto cP = matmul_pv_op.get_left_input_cooperative_tensor<half, half, float>();"
+  } else {
+    allocateP = ""
+  }
   let allocateO = ((0..<kBlocks).map {
-    "  auto cO_\($0) = matmul_pv_op.get_destination_cooperative_tensor<decltype(P), decltype(mV), float>();"
+    "  auto cO_\($0) = matmul_pv_op.get_destination_cooperative_tensor<decltype(\(preferredP)), decltype(mV), float>();"
   }).joined(separator: "\n")
   let initializeO = ((0..<kBlocks).map {
     "          cO_\($0)[k] = 0;"
@@ -34,16 +42,39 @@ func createSource(blockDimensions: BlockDimenions, attentionDimensions: Attentio
   let accumulateO0 = ((0..<kBlocks).map {
 """
     auto mV_0_\($0) = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), c);
-    matmul_pv_op.run(P, mV_0_\($0), cO_\($0));
+    matmul_pv_op.run(\(preferredP), mV_0_\($0), cO_\($0));
 """
   }).joined(separator: "\n")
   let accumulateO1 = ((0..<kBlocks).map {
 """
     auto mV_1_\($0) = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), c + \(blockDimensions.C));
-    matmul_pv_op.run(P, mV_1_\($0), cO_\($0));
+    matmul_pv_op.run(\(preferredP), mV_1_\($0), cO_\($0));
 """
   }).joined(separator: "\n")
-    let accumulateO0Remainder = ((0..<kBlocks).map {
+  func moveP(_ S: String) -> String {
+    if buildOptions.bypassThreadgroupMemory {
+      return """
+      #pragma clang loop unroll(full)
+      for (unsigned short k = 0; k < \(S).get_capacity(); ++k) {
+        if (\(S).is_valid_element(k)) {
+          cP[k] = (half)\(S)[k];
+        }
+      }
+"""
+    } else {
+      return """
+      #pragma clang loop unroll(full)
+      for (unsigned short k = 0; k < \(S).get_capacity(); ++k) {
+        if(\(S).is_valid_element(k)) {
+          auto idx = \(S).get_multidimensional_index(k);
+          P_buf[idx[0] + idx[1] * \(blockDimensions.C)] = (half)\(S)[k];
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+"""
+    }
+  }
+  let accumulateO0Remainder = ((0..<kBlocks).map {
   """
       auto mV_0_\($0) = V.slice<\(blockDimensions.K), dynamic_extent>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), C - C_remainder);
       matmul_pv_op.run(mP, mV_0_\($0), cO_\($0));
@@ -63,7 +94,7 @@ func createSource(blockDimensions: BlockDimenions, attentionDimensions: Attentio
     }
   }).joined(separator: "\n")
   let pvInnerDim: String
-  if blockDimensions.C % 32 == 0 {
+  if blockDimensions.C % 32 == 0 || buildOptions.bypassThreadgroupMemory {
     pvInnerDim = "\(blockDimensions.C)"
   } else {
     pvInnerDim = "dynamic_length_v<int>"
@@ -138,6 +169,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
   auto mV = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(0, 0);
   constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), \(pvInnerDim), false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<pv_desc, execution_simdgroups<1>> matmul_pv_op;
+\(allocateP)
 \(allocateO)
   for (uint c = 0; c < C_edge; c += \(blockDimensions.C * 2)) {
     #pragma clang loop unroll(full)
@@ -235,24 +267,10 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
         }
       }
     }
-    #pragma clang loop unroll(full)
-    for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
-      if(cS_0.is_valid_element(k)) {
-        auto idx = cS_0.get_multidimensional_index(k);
-        P_buf[idx[0] + idx[1] * \(blockDimensions.C)] = (half)cS_0[k];
-      }
-    }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+\(moveP("cS_0"))
 \(accumulateO0)
     if (c < C_edge_1) {
-      #pragma clang loop unroll(full)
-      for (unsigned short k = 0; k < cS_1.get_capacity(); ++k) {
-        if(cS_1.is_valid_element(k)) {
-          auto idx = cS_1.get_multidimensional_index(k);
-          P_buf[idx[0] + idx[1] * \(blockDimensions.C)] = (half)cS_1[k];
-        }
-      }
-      simdgroup_barrier(mem_flags::mem_threadgroup);
+\(moveP("cS_1"))
 \(accumulateO1)
     } else {
       #pragma clang loop unroll(full)
@@ -397,13 +415,13 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
 struct attention {
   static func main() {
     profileCorrectness()
-    // run(sequenceDimension: 194, headDimension: 128, Hq: 1, Hk: 1, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 1)
+    // run(sequenceDimension: 512, headDimension: 128, Hq: 1, Hk: 1, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 1)
   }
   
   static func profileCorrectness() {
     for i in 1..<1024 {
       print("Problem size: \(i)")
-      run(sequenceDimension: i, headDimension: 128, Hq: 8, Hk: 8, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 1)
+      run(sequenceDimension: i, headDimension: 128, Hq: 8, Hk: 8, buildOptions: BuildOptions(executionSIMDGroups: 16, bypassThreadgroupMemory: false), duplicatedCount: 1)
     }
   }
 
@@ -423,7 +441,7 @@ struct attention {
       fatalError("Could not create command queue")
     }
 
-    let blockDimensions = BlockDimenions(R: 16, C: 48, K: 128)
+    let blockDimensions = BlockDimenions(R: 16, C: 64, K: 128)
     let library: MTLLibrary
     do {
       let source = createSource(blockDimensions: blockDimensions, attentionDimensions: AttentionDimensions(R: sequenceDimension, C: sequenceDimension, K: headDimension, Hq: Hq, Hk: Hk), buildOptions: buildOptions)
