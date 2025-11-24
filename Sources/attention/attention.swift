@@ -267,6 +267,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
         }
       }
     }
+    simdgroup_barrier(mem_flags::mem_none);
 \(moveP("cS_0"))
 \(accumulateO0)
     if (c < C_edge_1) {
