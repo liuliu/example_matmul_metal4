@@ -331,8 +331,8 @@ kernel void reduce_sum(device half *A_buf [[buffer(0)]],
 @main
 struct matmul {
   static func main() {
-    profileCorrectness()
-    // run(M: 3072, N: 3072, K: 3072, blockDimensions: GEMMDimensions(M: 128, N: 64, K: 64), buildOptions: BuildOptions(executionSIMDGroups: 4, swapMN: true, splitK: 2), duplicatedCount: 1)
+    // profileCorrectness()
+    run(M: 32, N: 3072, K: 80000, blockDimensions: GEMMDimensions(M: 128, N: 64, K: 64), buildOptions: BuildOptions(cooperativeExecutionSIMDGroups: 4, preemptiveExecutionSIMDGroups: 1, swapMN: true, splitK: 30), duplicatedCount: 1)
   }
   
   static func profileCorrectness() {

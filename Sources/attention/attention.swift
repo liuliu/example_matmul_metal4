@@ -76,8 +76,8 @@ func createSource(blockDimensions: BlockDimenions, attentionDimensions: Attentio
   }
   let accumulateO0Remainder = ((0..<kBlocks).map {
   """
-      auto mV_0_\($0) = V.slice<\(blockDimensions.K), dynamic_extent>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), C - C_remainder);
-      matmul_pv_op.run(mP, mV_0_\($0), cO_\($0));
+      auto mV_0_\($0) = V.slice<\(blockDimensions.K), \(blockDimensions.C)>(tgid.y * \(attentionDimensions.K) + \($0 * blockDimensions.K), C - C_remainder);
+      matmul_pv_op.run(cP, mV_0_\($0), cO_\($0));
   """
   }).joined(separator: "\n")
   let writeO = ((0..<kBlocks).map {
@@ -274,23 +274,7 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
 \(moveP("cS_1"))
 \(accumulateO1)
     } else {
-      #pragma clang loop unroll(full)
-      for (unsigned short k = 0; k < cS_1.get_capacity(); ++k) {
-        if(cS_1.is_valid_element(k)) {
-          auto idx = cS_1.get_multidimensional_index(k);
-          if (idx[0] >= (int)C_remainder) {
-            P_buf[idx[0] - C_remainder + idx[1] * \(blockDimensions.C)] = 0;
-          } else {
-            P_buf[\(blockDimensions.C) - C_remainder + idx[0] + idx[1] * \(blockDimensions.C)] = (half)cS_1[k];
-          }
-        }
-      }
-      simdgroup_barrier(mem_flags::mem_threadgroup);
-      // The reason to do this is because when K (in GEMM sense) is smaller (in this case, C_remainder is smaller than blockDimensions.C),
-      // we need to start a new matmul descriptor with dynamic_extent for that, hence we copied the P_buf in this way and then sliced it.
-      auto mP = P.slice<dynamic_extent, \(blockDimensions.R)>(\(blockDimensions.C) - C_remainder, 0);
-      constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), dynamic_length_v<int>, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
-      matmul2d<pv_desc, execution_simdgroups<1>> matmul_pv_op;
+\(moveP("cS_1"))
 \(accumulateO0Remainder)
     }
   }
@@ -363,23 +347,8 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
 \(correctO)
       }
     }
-    #pragma clang loop unroll(full)
-    for (unsigned short k = 0; k < cS_0.get_capacity(); ++k) {
-      if(cS_0.is_valid_element(k)) {
-        auto idx = cS_0.get_multidimensional_index(k);
-        if (idx[0] >= (int)C_remainder) {
-          P_buf[idx[0] - C_remainder + idx[1] * \(blockDimensions.C)] = 0;
-        } else {
-          P_buf[\(blockDimensions.C) - C_remainder + idx[0] + idx[1] * \(blockDimensions.C)] = (half)cS_0[k];
-        }
-      }
-    }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    // The reason to do this is because when K (in GEMM sense) is smaller (in this case, C_remainder is smaller than blockDimensions.C),
-    // we need to start a new matmul descriptor with dynamic_extent for that, hence we copied the P_buf in this way and then sliced it.
-    auto mP = P.slice<dynamic_extent, \(blockDimensions.R)>(\(blockDimensions.C) - C_remainder, 0);
-    constexpr auto pv_desc = matmul2d_descriptor(\(blockDimensions.R), \(blockDimensions.K), dynamic_length_v<int>, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<pv_desc, execution_simdgroups<1>> matmul_pv_op;
+    simdgroup_barrier(mem_flags::mem_none);
+\(moveP("cS_0"))
 \(accumulateO0Remainder)
   }
   auto O = O_buf + tgid.x * (\(blockDimensions.R) * K_Hq) + tgid.y * \(attentionDimensions.K);
@@ -416,13 +385,13 @@ kernel void attention(device half *Q_buf [[buffer(0)]],
 struct attention {
   static func main() {
     profileCorrectness()
-    // run(sequenceDimension: 512, headDimension: 128, Hq: 1, Hk: 1, buildOptions: BuildOptions(executionSIMDGroups: 16), duplicatedCount: 1)
+    // run(sequenceDimension: 128, headDimension: 128, Hq: 1, Hk: 1, buildOptions: BuildOptions(executionSIMDGroups: 16, bypassThreadgroupMemory: true), duplicatedCount: 1)
   }
   
   static func profileCorrectness() {
     for i in 1..<1024 {
       print("Problem size: \(i)")
-      run(sequenceDimension: i, headDimension: 128, Hq: 8, Hk: 8, buildOptions: BuildOptions(executionSIMDGroups: 16, bypassThreadgroupMemory: false), duplicatedCount: 1)
+      run(sequenceDimension: i, headDimension: 128, Hq: 8, Hk: 8, buildOptions: BuildOptions(executionSIMDGroups: 16, bypassThreadgroupMemory: true), duplicatedCount: 1)
     }
   }
 
