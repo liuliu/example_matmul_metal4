@@ -1286,9 +1286,14 @@ final class TensorOpHorizontalPaddingSession3D {
     activation: [Float16],
     weights: [Float16]
   ) throws {
-    precondition(dimensions.paddingTop == 0 && dimensions.paddingBottom == 0, "First padding experiment only supports left/right padding.")
-    precondition(dimensions.paddingLeft == 1 && dimensions.paddingRight == 1, "First padding experiment expects padLeft=padRight=1.")
-    precondition(dimensions.kernelWidth == 3 && dimensions.dilationX == 1 && dimensions.strideX == 1, "First padding experiment assumes KW=3, dilationX=1, strideX=1.")
+    precondition(dimensions.paddingTop == 1 && dimensions.paddingBottom == 1, "Readable padded Conv3D session expects padTop=padBottom=1.")
+    precondition(dimensions.paddingLeft == 1 && dimensions.paddingRight == 1, "Readable padded Conv3D session expects padLeft=padRight=1.")
+    precondition(
+      dimensions.kernelWidth == 3 && dimensions.kernelHeight == 3 &&
+      dimensions.dilationX == 1 && dimensions.dilationY == 1 &&
+      dimensions.strideX == 1 && dimensions.strideY == 1,
+      "Readable padded Conv3D session assumes KH=KW=3, dilationX/Y=1, strideX/Y=1."
+    )
     self.dimensions = dimensions
     self.buildOptions = buildOptions
 
@@ -2763,14 +2768,113 @@ public enum ConvolutionHarness {
   }
 
   public static func defaultTensorOpConv3DLeftRightPaddingValidationCases() -> [Conv3DDimensions] {
-    defaultTensorOpConv3DValidationCases().filter {
-      $0.kernelWidth == 3 && $0.strideX == 1 && $0.dilationX == 1
-    }.map {
-      var dimensions = $0
-      dimensions.paddingLeft = 1
-      dimensions.paddingRight = 1
-      return dimensions
-    }
+    [
+      Conv3DDimensions(
+        batchSize: 1,
+        inputDepth: 5,
+        inputHeight: 5,
+        inputWidth: 5,
+        inputChannels: 1,
+        outputChannels: 1,
+        kernelDepth: 3,
+        kernelHeight: 3,
+        kernelWidth: 3,
+        strideZ: 1,
+        strideY: 1,
+        strideX: 1,
+        dilationZ: 1,
+        dilationY: 1,
+        dilationX: 1,
+        paddingTop: 1,
+        paddingBottom: 1,
+        paddingLeft: 1,
+        paddingRight: 1
+      ),
+      Conv3DDimensions(
+        batchSize: 1,
+        inputDepth: 4,
+        inputHeight: 5,
+        inputWidth: 5,
+        inputChannels: 4,
+        outputChannels: 8,
+        kernelDepth: 3,
+        kernelHeight: 3,
+        kernelWidth: 3,
+        strideZ: 1,
+        strideY: 1,
+        strideX: 1,
+        dilationZ: 1,
+        dilationY: 1,
+        dilationX: 1,
+        paddingTop: 1,
+        paddingBottom: 1,
+        paddingLeft: 1,
+        paddingRight: 1
+      ),
+      Conv3DDimensions(
+        batchSize: 2,
+        inputDepth: 7,
+        inputHeight: 6,
+        inputWidth: 7,
+        inputChannels: 3,
+        outputChannels: 5,
+        kernelDepth: 3,
+        kernelHeight: 3,
+        kernelWidth: 3,
+        strideZ: 2,
+        strideY: 1,
+        strideX: 1,
+        dilationZ: 1,
+        dilationY: 1,
+        dilationX: 1,
+        paddingTop: 1,
+        paddingBottom: 1,
+        paddingLeft: 1,
+        paddingRight: 1
+      ),
+      Conv3DDimensions(
+        batchSize: 1,
+        inputDepth: 5,
+        inputHeight: 17,
+        inputWidth: 19,
+        inputChannels: 8,
+        outputChannels: 12,
+        kernelDepth: 3,
+        kernelHeight: 3,
+        kernelWidth: 3,
+        strideZ: 1,
+        strideY: 1,
+        strideX: 1,
+        dilationZ: 1,
+        dilationY: 1,
+        dilationX: 1,
+        paddingTop: 1,
+        paddingBottom: 1,
+        paddingLeft: 1,
+        paddingRight: 1
+      ),
+      Conv3DDimensions(
+        batchSize: 1,
+        inputDepth: 4,
+        inputHeight: 33,
+        inputWidth: 35,
+        inputChannels: 4,
+        outputChannels: 8,
+        kernelDepth: 3,
+        kernelHeight: 3,
+        kernelWidth: 3,
+        strideZ: 1,
+        strideY: 1,
+        strideX: 1,
+        dilationZ: 1,
+        dilationY: 1,
+        dilationX: 1,
+        paddingTop: 1,
+        paddingBottom: 1,
+        paddingLeft: 1,
+        paddingRight: 1
+      ),
+    ]
   }
 
   public static func largeTensorOpConv3DProfileDimensions() -> Conv3DDimensions {
@@ -4191,8 +4295,8 @@ func createReadableConv3DHorizontalPaddingSource(
   let inputTileHeight =
     (outputTileHeight - 1) * spatialDimensions.strideY
     + (spatialDimensions.kernelHeight - 1) * spatialDimensions.dilationY + 1
-  let baseOffsetX = ((spatialDimensions.kernelWidth - 1) * spatialDimensions.dilationX / 2) - spatialDimensions.paddingLeft
-  let baseOffsetY = ((spatialDimensions.kernelHeight - 1) * spatialDimensions.dilationY / 2) - spatialDimensions.paddingTop
+  let baseOffsetX = (spatialDimensions.kernelWidth - 1) * spatialDimensions.dilationX / 2
+  let baseOffsetY = (spatialDimensions.kernelHeight - 1) * spatialDimensions.dilationY / 2
   let scopeType = "execution_simdgroups<\(buildOptions.executionSIMDGroups)>"
 
   func destinationSetup(mode: TensorOpConv3DMode) -> String {
@@ -4262,10 +4366,10 @@ kernel void \(mode.functionName())(device half *activation_buf [[buffer(0)]],
     return;
   }
 
-  const int unclamped_input_origin_x = output_origin_x * \(spatialDimensions.strideX);
-  const int unclamped_input_origin_y = output_origin_y * \(spatialDimensions.strideY);
-  const int clamped_input_origin_x = min(unclamped_input_origin_x, max(0, \(spatialDimensions.inputWidth - inputTileWidth)));
-  const int clamped_input_origin_y = min(unclamped_input_origin_y, max(0, \(spatialDimensions.inputHeight - inputTileHeight)));
+  const int unclamped_input_origin_x = output_origin_x * \(spatialDimensions.strideX) - \(spatialDimensions.paddingLeft);
+  const int unclamped_input_origin_y = output_origin_y * \(spatialDimensions.strideY) - \(spatialDimensions.paddingTop);
+  const int clamped_input_origin_x = max(0, min(unclamped_input_origin_x, max(0, \(spatialDimensions.inputWidth - inputTileWidth))));
+  const int clamped_input_origin_y = max(0, min(unclamped_input_origin_y, max(0, \(spatialDimensions.inputHeight - inputTileHeight))));
   const int adjusted_offset_x = \(baseOffsetX) + (unclamped_input_origin_x - clamped_input_origin_x);
   const int adjusted_offset_y = \(baseOffsetY) + (unclamped_input_origin_y - clamped_input_origin_y);
 

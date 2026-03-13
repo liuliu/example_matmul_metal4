@@ -308,8 +308,8 @@ func createReadablePaddedConv3DSource(
     (buildOptions.outputTileWidth - 1) * slice.strideX + (slice.kernelWidth - 1) * slice.dilationX + 1
   let inputTileHeight =
     (buildOptions.outputTileHeight - 1) * slice.strideY + (slice.kernelHeight - 1) * slice.dilationY + 1
-  let baseOffsetX = ((slice.kernelWidth - 1) * slice.dilationX / 2) - slice.paddingLeft
-  let baseOffsetY = ((slice.kernelHeight - 1) * slice.dilationY / 2) - slice.paddingTop
+  let baseOffsetX = (slice.kernelWidth - 1) * slice.dilationX / 2
+  let baseOffsetY = (slice.kernelHeight - 1) * slice.dilationY / 2
 
   return """
 
@@ -346,10 +346,10 @@ kernel void conv3d_padded_multiply(device half *activation_buf [[buffer(0)]],
     return;
   }
 
-  const int unclamped_input_origin_x = output_origin_x * \(slice.strideX);
-  const int unclamped_input_origin_y = output_origin_y * \(slice.strideY);
-  const int clamped_input_origin_x = min(unclamped_input_origin_x, max(0, \(slice.inputWidth - inputTileWidth)));
-  const int clamped_input_origin_y = min(unclamped_input_origin_y, max(0, \(slice.inputHeight - inputTileHeight)));
+  const int unclamped_input_origin_x = output_origin_x * \(slice.strideX) - \(slice.paddingLeft);
+  const int unclamped_input_origin_y = output_origin_y * \(slice.strideY) - \(slice.paddingTop);
+  const int clamped_input_origin_x = max(0, min(unclamped_input_origin_x, max(0, \(slice.inputWidth - inputTileWidth))));
+  const int clamped_input_origin_y = max(0, min(unclamped_input_origin_y, max(0, \(slice.inputHeight - inputTileHeight))));
   const int adjusted_offset_x = \(baseOffsetX) + (unclamped_input_origin_x - clamped_input_origin_x);
   const int adjusted_offset_y = \(baseOffsetY) + (unclamped_input_origin_y - clamped_input_origin_y);
 
@@ -447,10 +447,10 @@ kernel void conv3d_padded_macc(device half *activation_buf [[buffer(0)]],
     return;
   }
 
-  const int unclamped_input_origin_x = output_origin_x * \(slice.strideX);
-  const int unclamped_input_origin_y = output_origin_y * \(slice.strideY);
-  const int clamped_input_origin_x = min(unclamped_input_origin_x, max(0, \(slice.inputWidth - inputTileWidth)));
-  const int clamped_input_origin_y = min(unclamped_input_origin_y, max(0, \(slice.inputHeight - inputTileHeight)));
+  const int unclamped_input_origin_x = output_origin_x * \(slice.strideX) - \(slice.paddingLeft);
+  const int unclamped_input_origin_y = output_origin_y * \(slice.strideY) - \(slice.paddingTop);
+  const int clamped_input_origin_x = max(0, min(unclamped_input_origin_x, max(0, \(slice.inputWidth - inputTileWidth))));
+  const int clamped_input_origin_y = max(0, min(unclamped_input_origin_y, max(0, \(slice.inputHeight - inputTileHeight))));
   const int adjusted_offset_x = \(baseOffsetX) + (unclamped_input_origin_x - clamped_input_origin_x);
   const int adjusted_offset_y = \(baseOffsetY) + (unclamped_input_origin_y - clamped_input_origin_y);
 

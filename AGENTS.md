@@ -69,6 +69,23 @@
 
 ## `set_offsets(...)` Padding Handoff
 
+- Root cause of the full same-padding bug:
+  - tile origins must be computed in padded-input coordinates, not plain input coordinates
+  - the clamp must handle both bounds; using only `min(unclamped, upperBound)` is wrong because the first padded tile can still have a negative origin
+  - the correct clamp is `max(0, min(unclamped, upperBound))`
+- Final working rule:
+  - `unclampedInputOriginX = outputOriginX * strideX - paddingLeft`
+  - `unclampedInputOriginY = outputOriginY * strideY - paddingTop`
+  - `baseOffsetX = ((kernelWidth - 1) * dilationX) / 2`
+  - `baseOffsetY = ((kernelHeight - 1) * dilationY) / 2`
+  - `clampedInputOriginX = max(0, min(unclampedInputOriginX, max(0, inputWidth - inputTileWidth)))`
+  - `clampedInputOriginY = max(0, min(unclampedInputOriginY, max(0, inputHeight - inputTileHeight)))`
+  - `adjustedOffsetX = baseOffsetX + (unclampedInputOriginX - clampedInputOriginX)`
+  - `adjustedOffsetY = baseOffsetY + (unclampedInputOriginY - clampedInputOriginY)`
+- This rule now passes:
+  - local tiled Conv2D same-padding repro on M3 Pro
+  - device Conv3D same-padding validation on the M5 iPad
+
 - `convolution2d::set_offsets(...)` can implement zero padding. The local probe in `Sources/convolution/convolution.swift` showed that increasing an offset by `+1` shifts sampling by `+1` in that axis.
 - For a spatial tensor-op tile, the base padding offset is:
   - `baseOffsetX = ((kernelWidth - 1) * dilationX / 2) - paddingLeft`
@@ -76,13 +93,19 @@
 - That base offset is enough when the activation slice origin is the natural unclamped one.
 - The tiled edge bug came from the activation slice origin, not from `set_offsets(...)` itself.
 - The working edge rule is:
-  - `unclampedInputOriginX = outputOriginX * strideX`
-  - `unclampedInputOriginY = outputOriginY * strideY`
-  - `clampedInputOriginX = min(unclampedInputOriginX, max(0, inputWidth - inputTileWidth))`
-  - `clampedInputOriginY = min(unclampedInputOriginY, max(0, inputHeight - inputTileHeight))`
-  - `adjustedOffsetX = baseOffsetX + (unclampedInputOriginX - clampedInputOriginX)`
-  - `adjustedOffsetY = baseOffsetY + (unclampedInputOriginY - clampedInputOriginY)`
-- In words: clamp the activation slice so edge tiles still see the needed halo, then add the clamp delta back into `set_offsets(...)` so sampling still lands on the correct global input positions.
+  - express the tile origin in padded-input coordinates:
+    - `unclampedInputOriginX = outputOriginX * strideX - paddingLeft`
+    - `unclampedInputOriginY = outputOriginY * strideY - paddingTop`
+  - use center offsets, not `center - padding`:
+    - `baseOffsetX = ((kernelWidth - 1) * dilationX) / 2`
+    - `baseOffsetY = ((kernelHeight - 1) * dilationY) / 2`
+  - clamp both lower and upper bounds:
+    - `clampedInputOriginX = max(0, min(unclampedInputOriginX, max(0, inputWidth - inputTileWidth)))`
+    - `clampedInputOriginY = max(0, min(unclampedInputOriginY, max(0, inputHeight - inputTileHeight)))`
+  - then compensate the clamp in `set_offsets(...)`:
+    - `adjustedOffsetX = baseOffsetX + (unclampedInputOriginX - clampedInputOriginX)`
+    - `adjustedOffsetY = baseOffsetY + (unclampedInputOriginY - clampedInputOriginY)`
+- In words: compute tile coordinates in padded input space, clamp them into the real activation tensor, then push the clamp delta back into `set_offsets(...)`.
 - For Conv3D implemented as repeated spatial Conv2D launches:
   - use the same clamped-slice plus adjusted-offset rule on every `(outputDepth, kernelDepth)` launch
   - for the first depth slice, zero-init the cooperative destination
@@ -90,3 +113,12 @@
 - The single-dispatch readable version validated on both machines:
   - local M3 Pro: `Sources/convolution2d_padding/convolution2d_padding.swift` and `Sources/convolution3d_padding/convolution3d_padding.swift` both passed all tiled validation cases
   - iPad M5: the shared device path in `Sources/ConvolutionShared/ConvolutionShared.swift` passed all 3 Conv3D left/right padding validation cases with `maxAbsoluteError = 0.0` and `mismatches = 0`
+- A later full same-padding failure on both local Conv2D and device Conv3D turned out to be a clamp bug, not a mysterious device-only issue. The broken code used:
+  - `clampedInputOrigin = min(unclampedInputOrigin, max(0, inputSize - inputTileSize))`
+  - which clamps only the upper bound and still allows negative origins on the first padded tile.
+- That bug reproduced locally in `Sources/convolution2d_padding/convolution2d_padding.swift` on the M3 Pro with full `1,1,1,1` padding and `8x8` tiles.
+- After fixing the clamp to `max(0, min(...))` and using padded-input-space origins plus center offsets:
+  - the local Conv2D same-padding probe passed the larger `17x19, C=8, O=12` and `33x35, C=4, O=8` cases with zero mismatches
+  - the M5 iPad Conv3D padded validation also passed all 5 cases, including:
+    - `N=1, D=5, H=17, W=19, C=8, O=12`: `maxAbsoluteError = 0.001953125`, `mismatches = 0`
+    - `N=1, D=4, H=33, W=35, C=4, O=8`: `maxAbsoluteError = 0.0`, `mismatches = 0`

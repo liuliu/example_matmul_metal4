@@ -175,8 +175,8 @@ final class RunModel: ObservableObject {
     log: (String) -> Void
   ) -> Convolution3DValidationSuiteResult {
     log("")
-    log("Conv3D tensor-op left/right padding validation")
-    log("Padding assumption: left=1, right=1, top=0, bottom=0")
+    log("Conv3D tensor-op padded validation")
+    log("Padding assumption: left=1, right=1, top=1, bottom=1")
     let buildOptions = ConvolutionHarness.defaultTensorOpConv3DBuildOptions()
     if let outputTileWidth = buildOptions.outputTileWidth, let outputTileHeight = buildOptions.outputTileHeight {
       log("Build options: executionSIMDGroups=\(buildOptions.executionSIMDGroups), tile=\(outputTileWidth)x\(outputTileHeight)")
@@ -190,7 +190,7 @@ final class RunModel: ObservableObject {
       log("Max absolute error: \(result.tensorOpValidation.maxAbsoluteError)")
       log("Mismatches above tolerance: \(result.tensorOpValidation.mismatches)")
     }
-    log("All Conv3D left/right padding validation cases passed: \(validation.allPassed)")
+    log("All Conv3D padded validation cases passed: \(validation.allPassed)")
     return validation
   }
 

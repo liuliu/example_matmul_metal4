@@ -109,8 +109,8 @@ func referenceConvolution(
 func createSource(dims: Conv2DCase) -> String {
   let inputTileHeight = (dims.tileHeight - 1) * dims.strideY + (dims.kernelHeight - 1) * dims.dilationY + 1
   let inputTileWidth = (dims.tileWidth - 1) * dims.strideX + (dims.kernelWidth - 1) * dims.dilationX + 1
-  let baseOffsetY = ((dims.kernelHeight - 1) * dims.dilationY / 2) - dims.paddingTop
-  let baseOffsetX = ((dims.kernelWidth - 1) * dims.dilationX / 2) - dims.paddingLeft
+  let baseOffsetY = (dims.kernelHeight - 1) * dims.dilationY / 2
+  let baseOffsetX = (dims.kernelWidth - 1) * dims.dilationX / 2
 
   return """
 #include <metal_stdlib>
@@ -132,16 +132,19 @@ kernel void conv2d_padding_probe(
     return;
   }
 
-  const int unclamped_input_origin_x = output_origin_x * \(dims.strideX);
-  const int unclamped_input_origin_y = output_origin_y * \(dims.strideY);
-  const int clamped_input_origin_x = min(unclamped_input_origin_x, max(0, \(dims.inputWidth - inputTileWidth)));
-  const int clamped_input_origin_y = min(unclamped_input_origin_y, max(0, \(dims.inputHeight - inputTileHeight)));
+  const int unclamped_input_origin_x = output_origin_x * \(dims.strideX) - \(dims.paddingLeft);
+  const int unclamped_input_origin_y = output_origin_y * \(dims.strideY) - \(dims.paddingTop);
+  const int clamped_input_origin_x = max(0, min(unclamped_input_origin_x, max(0, \(dims.inputWidth - inputTileWidth))));
+  const int clamped_input_origin_y = max(0, min(unclamped_input_origin_y, max(0, \(dims.inputHeight - inputTileHeight))));
   const int adjusted_offset_x = \(baseOffsetX) + (unclamped_input_origin_x - clamped_input_origin_x);
   const int adjusted_offset_y = \(baseOffsetY) + (unclamped_input_origin_y - clamped_input_origin_y);
 
   auto activation_base = tensor<device half, dextents<int32_t, 4>, tensor_inline>(
       activation_buf,
       dextents<int32_t, 4>(\(dims.inputChannels), \(dims.inputWidth), \(dims.inputHeight), 1));
+  auto output_base = tensor<device half, dextents<int32_t, 4>, tensor_inline>(
+      output_buf,
+      dextents<int32_t, 4>(\(dims.outputChannels), \(dims.outputWidth), \(dims.outputHeight), 1));
   auto weights = tensor<device half, dextents<int32_t, 4>, tensor_inline>(
       weights_buf,
       dextents<int32_t, 4>(\(dims.outputChannels), \(dims.inputChannels), \(dims.kernelWidth), \(dims.kernelHeight)));
@@ -167,30 +170,10 @@ kernel void conv2d_padding_probe(
         clamped_input_origin_x,
         clamped_input_origin_y,
         0);
-    auto cOutput = conv2d_op.get_destination_cooperative_tensor<decltype(activation), decltype(weights), half>();
-    #pragma clang loop unroll(full)
-    for (unsigned short i = 0; i < cOutput.get_capacity(); ++i) {
-      if (cOutput.is_valid_element(i)) {
-        cOutput[i] = 0;
-      }
-    }
-    conv2d_op.run(activation, weights, cOutput);
-    #pragma clang loop unroll(full)
-    for (unsigned short i = 0; i < cOutput.get_capacity(); ++i) {
-      if (cOutput.is_valid_element(i)) {
-        auto idx = cOutput.get_multidimensional_index(i);
-        const int ox = output_origin_x + int(idx[1]);
-        const int oy = output_origin_y + int(idx[2]);
-        if (ox < \(dims.outputWidth) && oy < \(dims.outputHeight)) {
-          output_buf[((oy * \(dims.outputWidth) + ox) * \(dims.outputChannels)) + idx[0]] = cOutput[i];
-        }
-      }
-    }
-  } else {
-    auto activation = activation_base.slice(
+    auto output = output_base.slice<\(dims.outputChannels), \(dims.tileWidth), \(dims.tileHeight), 1>(
         0,
-        clamped_input_origin_x,
-        clamped_input_origin_y,
+        output_origin_x,
+        output_origin_y,
         0);
     auto cOutput = conv2d_op.get_destination_cooperative_tensor<decltype(activation), decltype(weights), half>();
     #pragma clang loop unroll(full)
@@ -200,17 +183,27 @@ kernel void conv2d_padding_probe(
       }
     }
     conv2d_op.run(activation, weights, cOutput);
+    cOutput.store(output);
+  } else {
+    auto activation = activation_base.slice(
+        0,
+        clamped_input_origin_x,
+        clamped_input_origin_y,
+        0);
+    auto output = output_base.slice(
+        0,
+        output_origin_x,
+        output_origin_y,
+        0);
+    auto cOutput = conv2d_op.get_destination_cooperative_tensor<decltype(activation), decltype(weights), half>();
     #pragma clang loop unroll(full)
     for (unsigned short i = 0; i < cOutput.get_capacity(); ++i) {
       if (cOutput.is_valid_element(i)) {
-        auto idx = cOutput.get_multidimensional_index(i);
-        const int ox = output_origin_x + int(idx[1]);
-        const int oy = output_origin_y + int(idx[2]);
-        if (ox < \(dims.outputWidth) && oy < \(dims.outputHeight)) {
-          output_buf[((oy * \(dims.outputWidth) + ox) * \(dims.outputChannels)) + idx[0]] = cOutput[i];
-        }
+        cOutput[i] = 0;
       }
     }
+    conv2d_op.run(activation, weights, cOutput);
+    cOutput.store(output);
   }
 }
 """
@@ -330,12 +323,12 @@ func cases() -> [Conv2DCase] {
       strideX: 1,
       dilationY: 1,
       dilationX: 1,
-      paddingTop: 0,
-      paddingBottom: 0,
+      paddingTop: 1,
+      paddingBottom: 1,
       paddingLeft: 1,
       paddingRight: 1,
-      tileHeight: 4,
-      tileWidth: 4
+      tileHeight: 8,
+      tileWidth: 8
     ),
     Conv2DCase(
       inputHeight: 5,
@@ -348,30 +341,48 @@ func cases() -> [Conv2DCase] {
       strideX: 1,
       dilationY: 1,
       dilationX: 1,
-      paddingTop: 0,
-      paddingBottom: 0,
+      paddingTop: 1,
+      paddingBottom: 1,
       paddingLeft: 1,
       paddingRight: 1,
-      tileHeight: 4,
-      tileWidth: 4
+      tileHeight: 8,
+      tileWidth: 8
     ),
     Conv2DCase(
-      inputHeight: 6,
-      inputWidth: 7,
-      inputChannels: 3,
-      outputChannels: 5,
+      inputHeight: 17,
+      inputWidth: 19,
+      inputChannels: 8,
+      outputChannels: 12,
       kernelHeight: 3,
       kernelWidth: 3,
       strideY: 1,
       strideX: 1,
       dilationY: 1,
       dilationX: 1,
-      paddingTop: 0,
-      paddingBottom: 0,
+      paddingTop: 1,
+      paddingBottom: 1,
       paddingLeft: 1,
       paddingRight: 1,
-      tileHeight: 4,
-      tileWidth: 4
+      tileHeight: 8,
+      tileWidth: 8
+    ),
+    Conv2DCase(
+      inputHeight: 33,
+      inputWidth: 35,
+      inputChannels: 4,
+      outputChannels: 8,
+      kernelHeight: 3,
+      kernelWidth: 3,
+      strideY: 1,
+      strideX: 1,
+      dilationY: 1,
+      dilationX: 1,
+      paddingTop: 1,
+      paddingBottom: 1,
+      paddingLeft: 1,
+      paddingRight: 1,
+      tileHeight: 8,
+      tileWidth: 8
     ),
   ]
 }
@@ -383,7 +394,8 @@ struct convolution2d_padding {
     print("Device: \(device.name)")
     print("Readable Conv2D padding probe")
     print("Padding is expressed with set_offsets(...).")
-    print("Every tile uses the same manual writeback path.")
+    print("Cases use full 1,1,1,1 same padding and 8x8 tiles.")
+    print("Every tile uses the same padded-input-space coordinate rule and cOutput.store(output).")
     print("")
 
     var allPassed = true
